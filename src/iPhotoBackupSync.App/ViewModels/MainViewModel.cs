@@ -114,7 +114,7 @@ public sealed partial class MainViewModel : ObservableObject
             FilterSyncNotSynced = false;
             FilterSyncError = false;
         });
-        SortByColumnCommand = new RelayCommand<SortField>(SortByColumn);
+        SortByColumnCommand = new RelayCommand<SortField>(SortByColumn, _ => !IsBusy);
         CopySelectedCommand = new AsyncRelayCommand(RunCopySelectedAsync, () => !IsBusy && HasResults);
         ExportCsvCommand = new RelayCommand(ExportCsv, () => HasResults);
         RevealInExplorerCommand = new RelayCommand<FileNodeViewModel>(RevealInExplorer);
@@ -135,6 +135,7 @@ public sealed partial class MainViewModel : ObservableObject
                 CollapseAllCommand.NotifyCanExecuteChanged();
                 SelectAllCommand.NotifyCanExecuteChanged();
                 ClearSelectionCommand.NotifyCanExecuteChanged();
+                SortByColumnCommand.NotifyCanExecuteChanged();
             }
             if (e.PropertyName is nameof(FilterText) or nameof(FilterDateFrom) or nameof(FilterDateTo)
                 or nameof(FilterSyncRefreshing) or nameof(FilterSyncSynced) or nameof(FilterSyncNotSynced) or nameof(FilterSyncError))
@@ -203,8 +204,28 @@ public sealed partial class MainViewModel : ObservableObject
 
         try
         {
-            var root = await _comparer.CompareAsync(OriginPath, DestinationPath, progress, _cts.Token);
-            PopulateResults(root);
+            // The scan itself (directory enumeration, tree construction, sorting) is
+            // CPU/IO-bound synchronous work under the hood despite the async signature
+            // -- running it via Task.Run keeps it off the UI thread so the window stays
+            // responsive. Only IProgress<T> callbacks (already marshaled back to the UI
+            // thread since this Progress<T> was constructed here) and the final
+            // ObservableCollection update touch the UI thread.
+            var originPath = OriginPath;
+            var destinationPath = DestinationPath;
+            var (root, topLevelNodes) = await Task.Run(async () =>
+            {
+                var r = await _comparer.CompareAsync(originPath, destinationPath, progress, _cts.Token);
+                var nodes = r.Children.Select(c => new FileNodeViewModel(c, null, 0, OnLeafSelectionChanged)).ToList();
+                nodes = SortNodesRecursive(nodes);
+                return (r, nodes);
+            }, _cts.Token);
+
+            _topLevelNodes = topLevelNodes;
+            ResultsSummary = $"{root.MissingFileCount:N0} missing file(s), {FormatBytes(root.MissingSizeBytes)} total";
+            HasResults = true;
+            RefreshView();
+            NotifySortGlyphsChanged();
+
             StatusMessage = root.MissingFileCount == 0
                 ? "No differences found: everything in the origin folder already exists in the destination."
                 : "Comparison complete.";
@@ -224,18 +245,6 @@ public sealed partial class MainViewModel : ObservableObject
             ProgressDetail = string.Empty;
             _cts = null;
         }
-    }
-
-    private void PopulateResults(FileNode root)
-    {
-        _topLevelNodes = root.Children.Select(c => new FileNodeViewModel(c, null, 0, OnLeafSelectionChanged)).ToList();
-        ApplySort();
-
-        ResultsSummary = $"{root.MissingFileCount:N0} missing file(s), {FormatBytes(root.MissingSizeBytes)} total";
-        HasResults = true;
-
-        RefreshView();
-        NotifySortGlyphsChanged();
     }
 
     // --- Expand / collapse -------------------------------------------------
@@ -580,9 +589,17 @@ public sealed partial class MainViewModel : ObservableObject
 
         try
         {
-            await _actionService.CopyToDestinationAsync(
-                selected.Select(vm => vm.Node), OriginPath, DestinationPath, progress, _cts.Token);
-            StatusMessage = $"Copied {selected.Count:N0} selected item(s) to the destination. Re-run Compare to refresh the list.";
+            var nodesToCopy = selected.Select(vm => vm.Node).ToList();
+            var copiedCount = selected.Count;
+
+            // Run off the UI thread: opening/copying many files (especially over a
+            // NAS) can add up even though each individual await yields, and this
+            // keeps the window responsive throughout.
+            await Task.Run(() => _actionService.CopyToDestinationAsync(
+                nodesToCopy, OriginPath, DestinationPath, progress, _cts.Token), _cts.Token);
+
+            StatusMessage = $"Copied {copiedCount:N0} selected item(s) to the destination. Refreshing...";
+            await RunCompareAsync();
         }
         catch (OperationCanceledException)
         {
