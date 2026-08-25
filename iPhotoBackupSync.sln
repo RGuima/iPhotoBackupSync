@@ -1,0 +1,41 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{6787FBAC-2442-4C88-81BD-A2F8198B9DFB}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "iPhotoBackupSync.Core", "src\iPhotoBackupSync.Core\iPhotoBackupSync.Core.csproj", "{23457E65-1B1D-4DAC-8848-B2A71C77178B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "iPhotoBackupSync.App", "src\iPhotoBackupSync.App\iPhotoBackupSync.App.csproj", "{9C2DCFC8-1499-4BDA-84E9-230D2242D1AA}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "iPhotoBackupSync.Tests", "src\iPhotoBackupSync.Tests\iPhotoBackupSync.Tests.csproj", "{3CA3EDD6-FF9D-4FD5-AC55-5CBD466962F3}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{23457E65-1B1D-4DAC-8848-B2A71C77178B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{23457E65-1B1D-4DAC-8848-B2A71C77178B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{23457E65-1B1D-4DAC-8848-B2A71C77178B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{23457E65-1B1D-4DAC-8848-B2A71C77178B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9C2DCFC8-1499-4BDA-84E9-230D2242D1AA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9C2DCFC8-1499-4BDA-84E9-230D2242D1AA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9C2DCFC8-1499-4BDA-84E9-230D2242D1AA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9C2DCFC8-1499-4BDA-84E9-230D2242D1AA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3CA3EDD6-FF9D-4FD5-AC55-5CBD466962F3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3CA3EDD6-FF9D-4FD5-AC55-5CBD466962F3}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3CA3EDD6-FF9D-4FD5-AC55-5CBD466962F3}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3CA3EDD6-FF9D-4FD5-AC55-5CBD466962F3}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{23457E65-1B1D-4DAC-8848-B2A71C77178B} = {6787FBAC-2442-4C88-81BD-A2F8198B9DFB}
+		{9C2DCFC8-1499-4BDA-84E9-230D2242D1AA} = {6787FBAC-2442-4C88-81BD-A2F8198B9DFB}
+		{3CA3EDD6-FF9D-4FD5-AC55-5CBD466962F3} = {6787FBAC-2442-4C88-81BD-A2F8198B9DFB}
+	EndGlobalSection
+EndGlobal

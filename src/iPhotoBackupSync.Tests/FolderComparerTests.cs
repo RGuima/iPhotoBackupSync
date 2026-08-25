@@ -1,0 +1,106 @@
+using iPhotoBackupSync.Core.Models;
+using iPhotoBackupSync.Core.Services;
+using Xunit;
+
+namespace iPhotoBackupSync.Tests;
+
+public sealed class FolderComparerTests : IDisposable
+{
+    private readonly string _root;
+    private readonly string _origin;
+    private readonly string _destination;
+
+    public FolderComparerTests()
+    {
+        _root = Path.Combine(Path.GetTempPath(), "iPhotoBackupSync.Tests_" + Guid.NewGuid());
+        _origin = Path.Combine(_root, "origin");
+        _destination = Path.Combine(_root, "destination");
+        Directory.CreateDirectory(_origin);
+        Directory.CreateDirectory(_destination);
+    }
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_root, recursive: true); } catch { /* best effort cleanup */ }
+    }
+
+    private void WriteOrigin(string relativePath, string content = "x")
+    {
+        var full = Path.Combine(_origin, relativePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+        File.WriteAllText(full, content);
+    }
+
+    private void WriteDestination(string relativePath, string content = "x")
+    {
+        var full = Path.Combine(_destination, relativePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+        File.WriteAllText(full, content);
+    }
+
+    private static List<FileNode> FlattenFiles(FileNode node)
+    {
+        var result = new List<FileNode>();
+        void Walk(FileNode n)
+        {
+            if (!n.IsDirectory) result.Add(n);
+            foreach (var c in n.Children) Walk(c);
+        }
+        foreach (var c in node.Children) Walk(c);
+        return result;
+    }
+
+    [Fact]
+    public async Task FileOnlyInOrigin_IsReportedMissing()
+    {
+        WriteOrigin("root1.jpg");
+        WriteOrigin("SubA/a1.jpg");
+        WriteOrigin("SubA/a2.jpg");
+        WriteDestination("SubA/a1.jpg");
+
+        var comparer = new FolderComparer();
+        var result = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
+
+        var missing = FlattenFiles(result).Select(f => f.RelativePath).OrderBy(x => x).ToList();
+        Assert.Equal(new[] { "root1.jpg", "SubA\\a2.jpg" }, missing);
+        Assert.Equal(2, result.MissingFileCount);
+    }
+
+    [Fact]
+    public async Task IdenticalTrees_ProduceNoResults()
+    {
+        WriteOrigin("SubA/a1.jpg");
+        WriteDestination("SubA/a1.jpg");
+
+        var comparer = new FolderComparer();
+        var result = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
+
+        Assert.Empty(result.Children);
+        Assert.Equal(0, result.MissingFileCount);
+    }
+
+    [Fact]
+    public async Task EntireMissingSubfolder_ListsAllNestedFiles()
+    {
+        WriteOrigin("SubB/nested/deep.jpg");
+        WriteOrigin("SubB/b1.jpg");
+
+        var comparer = new FolderComparer();
+        var result = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
+
+        var missing = FlattenFiles(result).Select(f => f.RelativePath).OrderBy(x => x).ToList();
+        Assert.Equal(new[] { "SubB\\b1.jpg", "SubB\\nested\\deep.jpg" }, missing);
+    }
+
+    [Fact]
+    public async Task NonExistentDestination_TreatsEverythingAsMissing()
+    {
+        WriteOrigin("root1.jpg");
+        Directory.Delete(_destination);
+
+        var comparer = new FolderComparer();
+        var result = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
+
+        Assert.Equal(1, result.MissingFileCount);
+    }
+}
