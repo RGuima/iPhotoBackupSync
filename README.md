@@ -73,15 +73,25 @@ dotnet test src/iPhotoBackupSync.Tests/iPhotoBackupSync.Tests.csproj
 
 ## Notes & limitations
 
-- **iCloud sync status is a best-effort heuristic.** The Cloud Filter API
-  exposes a point-in-time placeholder state (in-sync / partially-on-disk /
-  placeholder), not a live "% complete" for an in-flight transfer, so
-  "Refreshing" is inferred from a partially-hydrated, not-yet-in-sync state
-  rather than guaranteed to reflect an active transfer. A file with no
-  placeholder markers at all (no pending-upload or reparse-point flags) is
-  treated as **Synced**, since cloud providers mark files that still need to
-  be uploaded as "dirty" placeholders immediately -- the absence of any such
-  marker is the normal state for a file that has already finished uploading.
+- **iCloud sync status uses two different OS signals, chosen based on what a
+  real iCloud Photos folder actually reports.** Sampling a real 52,000+ file
+  "iCloud Photos" folder showed that iCloud for Windows does **not** use the
+  Windows Cloud Filter API's reparse-point placeholders (`cldapi.dll`) at all
+  -- every file came back `CF_PLACEHOLDER_STATE_NO_STATES`. Instead it marks
+  files with the lighter-weight cloud-file *attribute* bits: a file with
+  `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` (or `RECALL_ON_OPEN`) isn't fully
+  present on disk yet and would have to be fetched from the cloud to be
+  opened, so it's shown as **Refreshing** (still downloading / queued) even
+  though the same file might separately show as "in sync" at the metadata
+  level -- local content completeness wins over that metadata bit. A file
+  with neither of those attributes nor any placeholder markers is treated as
+  **Synced**, since cloud providers mark a file that still needs to be
+  uploaded, or isn't fully downloaded, immediately -- the absence of any such
+  marker is the normal state for a file that's already finished syncing. The
+  Cloud Filter placeholder path is still checked first and used when present,
+  so a provider that *does* use reparse-point placeholders (OneDrive, for
+  example) is handled by that path instead. Neither mechanism reports a live
+  "% complete" for an in-flight transfer.
 - Comparison is by **path and structure only** -- it does not compare file
   contents, size, or modified date to detect changes to a file that exists
   on both sides. That keeps scans fast on very large libraries, but it also

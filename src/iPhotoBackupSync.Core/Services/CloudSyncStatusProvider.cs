@@ -4,14 +4,23 @@ using iPhotoBackupSync.Core.Models;
 namespace iPhotoBackupSync.Core.Services;
 
 /// <summary>
-/// Reads the cloud placeholder state of a file via the Windows Cloud Filter API
-/// (cldapi.dll). This is the same OS mechanism iCloud for Windows, OneDrive, and
-/// Dropbox use to mark files as "cloud only", "in sync", or "locally modified".
+/// Reads the cloud sync state of a file. Two independent OS mechanisms are checked:
 ///
-/// The API only exposes a point-in-time placeholder state; it does not report a
-/// live "percent complete" for an in-flight transfer. "Refreshing" below is a
-/// best-effort heuristic (a placeholder that is partially hydrated and not yet
-/// marked in-sync) rather than a guaranteed live indicator.
+/// 1. The Windows Cloud Filter API (cldapi.dll), used by OneDrive and some other
+///    providers, which marks a file as a reparse-point-based placeholder with an
+///    explicit in-sync / partially-hydrated / dirty state.
+/// 2. The lighter-weight cloud-file *attribute* bits (FILE_ATTRIBUTE_PINNED /
+///    UNPINNED / RECALL_ON_DATA_ACCESS / RECALL_ON_OPEN), which don't require a
+///    reparse point at all. Sampling a real "iCloud Photos" folder on Windows
+///    showed every single file returning CF_PLACEHOLDER_STATE_NO_STATES (i.e. not
+///    a Cloud Filter placeholder at all) -- iCloud for Windows relies entirely on
+///    this second, attribute-only mechanism instead. FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+///    means the file's content is not fully present on disk and would need to be
+///    fetched from the cloud to be opened, i.e. it is still in the download queue.
+///
+/// Neither mechanism reports a live "percent complete" for an in-flight transfer,
+/// so "Refreshing" here is a best-effort "not fully available locally yet" signal
+/// rather than a guaranteed indicator of an active transfer.
 /// </summary>
 public sealed class CloudSyncStatusProvider
 {
@@ -52,6 +61,8 @@ public sealed class CloudSyncStatusProvider
     }
 
     private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+    private const uint FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000;
+    private const uint FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000;
 
     private static SyncStatus Interpret(uint fileAttributes, CF_PLACEHOLDER_STATE state)
     {
@@ -62,14 +73,28 @@ public sealed class CloudSyncStatusProvider
 
         if (state.HasFlag(CF_PLACEHOLDER_STATE.PLACEHOLDER))
         {
-            if (state.HasFlag(CF_PLACEHOLDER_STATE.IN_SYNC))
+            // Local content completeness takes priority over the metadata-only
+            // IN_SYNC bit: a file that hasn't finished downloading is still "in
+            // the queue", not "synced", regardless of whether its metadata has
+            // already been confirmed to match the server.
+            var notFullyOnDisk = state.HasFlag(CF_PLACEHOLDER_STATE.NO_CONTENT) ||
+                                 state.HasFlag(CF_PLACEHOLDER_STATE.PARTIAL) ||
+                                 state.HasFlag(CF_PLACEHOLDER_STATE.PARTIALLY_ON_DISK);
+            if (notFullyOnDisk)
             {
-                return SyncStatus.Synced;
+                return SyncStatus.Refreshing;
             }
 
-            var partial = state.HasFlag(CF_PLACEHOLDER_STATE.PARTIAL) ||
-                          state.HasFlag(CF_PLACEHOLDER_STATE.PARTIALLY_ON_DISK);
-            return partial ? SyncStatus.Refreshing : SyncStatus.NotSynced;
+            return state.HasFlag(CF_PLACEHOLDER_STATE.IN_SYNC) ? SyncStatus.Synced : SyncStatus.NotSynced;
+        }
+
+        // Not a Cloud Filter reparse-point placeholder. iCloud for Windows marks
+        // files this way instead: FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS / RECALL_ON_OPEN
+        // mean the file's content isn't fully present locally and would have to be
+        // fetched from the cloud to be opened -- i.e. it's still downloading / queued.
+        if ((fileAttributes & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN)) != 0)
+        {
+            return SyncStatus.Refreshing;
         }
 
         if ((fileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
@@ -79,14 +104,10 @@ public sealed class CloudSyncStatusProvider
             return SyncStatus.Error;
         }
 
-        // No placeholder markers at all. Cloud providers (iCloud, OneDrive, Dropbox)
-        // mark a file that still needs to be uploaded with a "dirty" placeholder
-        // immediately, so a plain, fully-hydrated file with no such marker inside a
-        // cloud-managed library is, in practice, one that has already finished
-        // uploading -- some providers drop the placeholder reparse point entirely
-        // once a file is fully downloaded and confirmed in sync. Treating this case
-        // as "not synced" (the previous behavior) made every already-backed-up photo
-        // look unsynced, which is wrong far more often than treating it as synced is.
+        // No placeholder or recall markers at all. Cloud providers mark a file
+        // that still needs to be uploaded, or isn't fully downloaded, immediately
+        // -- so a plain file with no such marker inside a cloud-managed library
+        // is, in practice, one that has already finished syncing.
         return SyncStatus.Synced;
     }
 
