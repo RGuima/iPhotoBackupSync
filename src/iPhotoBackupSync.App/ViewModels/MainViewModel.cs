@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
+using System.Windows.Input;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using iPhotoBackupSync.App.Services;
@@ -15,10 +16,9 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly FileActionService _actionService = new();
     private CancellationTokenSource? _cts;
     private List<FileNodeViewModel> _topLevelNodes = new();
+    private List<SortCriterion> _sortCriteria = new() { new SortCriterion(SortField.Name, false) };
 
     public ObservableCollection<FileNodeViewModel> FlattenedItems { get; } = new();
-
-    public IReadOnlyList<SortField> SortFields { get; } = Enum.GetValues<SortField>();
 
     [ObservableProperty]
     private string _originPath = string.Empty;
@@ -51,10 +51,31 @@ public sealed partial class MainViewModel : ObservableObject
     private DateTime? _filterDateTo;
 
     [ObservableProperty]
-    private SortField _sortField = SortField.Name;
+    private bool _filterSyncRefreshing;
 
     [ObservableProperty]
-    private bool _sortDescending;
+    private bool _filterSyncSynced;
+
+    [ObservableProperty]
+    private bool _filterSyncNotSynced;
+
+    [ObservableProperty]
+    private bool _filterSyncError;
+
+    [ObservableProperty]
+    private int _selectedCount;
+
+    [ObservableProperty]
+    private long _selectedSizeBytes;
+
+    public string SelectionSummary => SelectedCount == 0
+        ? "No items selected"
+        : $"{SelectedCount:N0} selected ({FormatBytes(SelectedSizeBytes)})";
+
+    public string NameSortGlyph => GetSortGlyph(SortField.Name);
+    public string SizeSortGlyph => GetSortGlyph(SortField.Size);
+    public string LastModifiedSortGlyph => GetSortGlyph(SortField.LastModified);
+    public string SyncStatusSortGlyph => GetSortGlyph(SortField.SyncStatus);
 
     public IRelayCommand BrowseOriginCommand { get; }
     public IRelayCommand BrowseDestinationCommand { get; }
@@ -66,6 +87,7 @@ public sealed partial class MainViewModel : ObservableObject
     public IRelayCommand SelectAllCommand { get; }
     public IRelayCommand ClearSelectionCommand { get; }
     public IRelayCommand ClearFiltersCommand { get; }
+    public IRelayCommand<SortField> SortByColumnCommand { get; }
     public IAsyncRelayCommand CopySelectedCommand { get; }
     public IRelayCommand ExportCsvCommand { get; }
     public IRelayCommand<FileNodeViewModel> RevealInExplorerCommand { get; }
@@ -87,7 +109,12 @@ public sealed partial class MainViewModel : ObservableObject
             FilterText = string.Empty;
             FilterDateFrom = null;
             FilterDateTo = null;
+            FilterSyncRefreshing = false;
+            FilterSyncSynced = false;
+            FilterSyncNotSynced = false;
+            FilterSyncError = false;
         });
+        SortByColumnCommand = new RelayCommand<SortField>(SortByColumn);
         CopySelectedCommand = new AsyncRelayCommand(RunCopySelectedAsync, () => !IsBusy && HasResults);
         ExportCsvCommand = new RelayCommand(ExportCsv, () => HasResults);
         RevealInExplorerCommand = new RelayCommand<FileNodeViewModel>(RevealInExplorer);
@@ -109,15 +136,15 @@ public sealed partial class MainViewModel : ObservableObject
                 SelectAllCommand.NotifyCanExecuteChanged();
                 ClearSelectionCommand.NotifyCanExecuteChanged();
             }
-            if (e.PropertyName is nameof(FilterText) or nameof(FilterDateFrom) or nameof(FilterDateTo))
+            if (e.PropertyName is nameof(FilterText) or nameof(FilterDateFrom) or nameof(FilterDateTo)
+                or nameof(FilterSyncRefreshing) or nameof(FilterSyncSynced) or nameof(FilterSyncNotSynced) or nameof(FilterSyncError))
             {
                 OnPropertyChanged(nameof(IsFilterActive));
                 RefreshView();
             }
-            if (e.PropertyName is nameof(SortField) or nameof(SortDescending))
+            if (e.PropertyName is nameof(SelectedCount) or nameof(SelectedSizeBytes))
             {
-                ApplySort();
-                RefreshView();
+                OnPropertyChanged(nameof(SelectionSummary));
             }
         };
 
@@ -157,6 +184,8 @@ public sealed partial class MainViewModel : ObservableObject
         HasResults = false;
         FlattenedItems.Clear();
         _topLevelNodes.Clear();
+        SelectedCount = 0;
+        SelectedSizeBytes = 0;
         StatusMessage = "Comparing...";
         _cts = new CancellationTokenSource();
 
@@ -199,13 +228,14 @@ public sealed partial class MainViewModel : ObservableObject
 
     private void PopulateResults(FileNode root)
     {
-        _topLevelNodes = root.Children.Select(c => new FileNodeViewModel(c, null, 0)).ToList();
+        _topLevelNodes = root.Children.Select(c => new FileNodeViewModel(c, null, 0, OnLeafSelectionChanged)).ToList();
         ApplySort();
 
         ResultsSummary = $"{root.MissingFileCount:N0} missing file(s), {FormatBytes(root.MissingSizeBytes)} total";
         HasResults = true;
 
         RefreshView();
+        NotifySortGlyphsChanged();
     }
 
     // --- Expand / collapse -------------------------------------------------
@@ -280,6 +310,20 @@ public sealed partial class MainViewModel : ObservableObject
 
     // --- Selection -----------------------------------------------------------
 
+    private void OnLeafSelectionChanged(FileNodeViewModel node, bool? oldValue, bool? newValue)
+    {
+        if (oldValue == true)
+        {
+            SelectedCount--;
+            SelectedSizeBytes -= node.Node.SizeBytes;
+        }
+        if (newValue == true)
+        {
+            SelectedCount++;
+            SelectedSizeBytes += node.Node.SizeBytes;
+        }
+    }
+
     private void SetSelectionRecursive(IEnumerable<FileNodeViewModel> nodes, bool value)
     {
         foreach (var node in nodes)
@@ -297,13 +341,30 @@ public sealed partial class MainViewModel : ObservableObject
 
     // --- Filtering -------------------------------------------------------
 
-    public bool IsFilterActive => !string.IsNullOrWhiteSpace(FilterText) || FilterDateFrom.HasValue || FilterDateTo.HasValue;
+    private bool AnySyncFilterActive => FilterSyncRefreshing || FilterSyncSynced || FilterSyncNotSynced || FilterSyncError;
+
+    public bool IsFilterActive => !string.IsNullOrWhiteSpace(FilterText) || FilterDateFrom.HasValue || FilterDateTo.HasValue || AnySyncFilterActive;
+
+    private bool SyncStatusMatches(SyncStatus status)
+    {
+        if (!AnySyncFilterActive) return true;
+        return status switch
+        {
+            SyncStatus.Refreshing => FilterSyncRefreshing,
+            SyncStatus.Synced => FilterSyncSynced,
+            SyncStatus.NotSynced => FilterSyncNotSynced,
+            SyncStatus.Error => FilterSyncError,
+            _ => true
+        };
+    }
 
     private bool NodeMatchesFilter(FileNodeViewModel node)
     {
         var nameOk = string.IsNullOrWhiteSpace(FilterText) ||
                      node.Name.Contains(FilterText, StringComparison.OrdinalIgnoreCase);
         if (!nameOk) return false;
+
+        if (!SyncStatusMatches(node.SyncStatus)) return false;
 
         if (FilterDateFrom.HasValue || FilterDateTo.HasValue)
         {
@@ -325,9 +386,9 @@ public sealed partial class MainViewModel : ObservableObject
                 var folderNameMatches = !string.IsNullOrWhiteSpace(FilterText) &&
                                          node.Name.Contains(FilterText, StringComparison.OrdinalIgnoreCase);
 
-                if (folderNameMatches && !FilterDateFrom.HasValue && !FilterDateTo.HasValue)
+                if (folderNameMatches && !FilterDateFrom.HasValue && !FilterDateTo.HasValue && !AnySyncFilterActive)
                 {
-                    // The folder itself matches by name and there's no date constraint:
+                    // The folder itself matches by name and there's no other constraint:
                     // show it and everything inside without filtering further.
                     output.Add(node);
                     AddAllDescendants(node, output);
@@ -363,6 +424,52 @@ public sealed partial class MainViewModel : ObservableObject
 
     // --- Sorting -----------------------------------------------------------
 
+    private void SortByColumn(SortField field)
+    {
+        var additive = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift);
+        var existing = _sortCriteria.FirstOrDefault(c => c.Field == field);
+
+        if (!additive)
+        {
+            if (_sortCriteria.Count == 1 && existing != null)
+            {
+                existing.Descending = !existing.Descending;
+            }
+            else
+            {
+                _sortCriteria = new List<SortCriterion> { new(field, existing?.Descending ?? false) };
+            }
+        }
+        else if (existing != null)
+        {
+            existing.Descending = !existing.Descending;
+        }
+        else
+        {
+            _sortCriteria.Add(new SortCriterion(field, false));
+        }
+
+        ApplySort();
+        RefreshView();
+        NotifySortGlyphsChanged();
+    }
+
+    private void NotifySortGlyphsChanged()
+    {
+        OnPropertyChanged(nameof(NameSortGlyph));
+        OnPropertyChanged(nameof(SizeSortGlyph));
+        OnPropertyChanged(nameof(LastModifiedSortGlyph));
+        OnPropertyChanged(nameof(SyncStatusSortGlyph));
+    }
+
+    private string GetSortGlyph(SortField field)
+    {
+        var index = _sortCriteria.FindIndex(c => c.Field == field);
+        if (index < 0) return string.Empty;
+        var arrow = _sortCriteria[index].Descending ? "▼" : "▲";
+        return _sortCriteria.Count > 1 ? $"{arrow}{index + 1}" : arrow;
+    }
+
     private void ApplySort()
     {
         if (_topLevelNodes.Count == 0) return;
@@ -387,22 +494,30 @@ public sealed partial class MainViewModel : ObservableObject
     private List<FileNodeViewModel> SortNodes(List<FileNodeViewModel> nodes)
     {
         var query = nodes.OrderBy(n => n.IsDirectory ? 0 : 1);
-        query = SortField switch
+        foreach (var criterion in _sortCriteria)
         {
-            SortField.Size => SortDescending
+            query = ApplyCriterion(query, criterion);
+        }
+        return query.ToList();
+    }
+
+    private static IOrderedEnumerable<FileNodeViewModel> ApplyCriterion(IOrderedEnumerable<FileNodeViewModel> query, SortCriterion c)
+    {
+        return c.Field switch
+        {
+            SortField.Size => c.Descending
                 ? query.ThenByDescending(n => n.IsDirectory ? n.Node.MissingSizeBytes : n.Node.SizeBytes)
                 : query.ThenBy(n => n.IsDirectory ? n.Node.MissingSizeBytes : n.Node.SizeBytes),
-            SortField.LastModified => SortDescending
+            SortField.LastModified => c.Descending
                 ? query.ThenByDescending(n => n.Node.LastModifiedUtc ?? DateTime.MinValue)
                 : query.ThenBy(n => n.Node.LastModifiedUtc ?? DateTime.MinValue),
-            SortField.SyncStatus => SortDescending
+            SortField.SyncStatus => c.Descending
                 ? query.ThenByDescending(n => (int)n.SyncStatus)
                 : query.ThenBy(n => (int)n.SyncStatus),
-            _ => SortDescending
+            _ => c.Descending
                 ? query.ThenByDescending(n => n.Name, StringComparer.OrdinalIgnoreCase)
                 : query.ThenBy(n => n.Name, StringComparer.OrdinalIgnoreCase)
         };
-        return query.ToList();
     }
 
     // --- View rebuilding ---------------------------------------------------

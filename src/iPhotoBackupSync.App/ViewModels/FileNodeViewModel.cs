@@ -10,15 +10,19 @@ public sealed partial class FileNodeViewModel : ObservableObject
     public int Depth { get; }
     public List<FileNodeViewModel> Children { get; } = new();
 
-    public FileNodeViewModel(FileNode node, FileNodeViewModel? parent, int depth)
+    private readonly Action<FileNodeViewModel, bool?, bool?>? _onLeafSelectionChanged;
+
+    public FileNodeViewModel(FileNode node, FileNodeViewModel? parent, int depth,
+        Action<FileNodeViewModel, bool?, bool?>? onLeafSelectionChanged = null)
     {
         Node = node;
         Parent = parent;
         Depth = depth;
+        _onLeafSelectionChanged = onLeafSelectionChanged;
 
         foreach (var child in node.Children)
         {
-            Children.Add(new FileNodeViewModel(child, this, depth + 1));
+            Children.Add(new FileNodeViewModel(child, this, depth + 1, onLeafSelectionChanged));
         }
     }
 
@@ -52,8 +56,14 @@ public sealed partial class FileNodeViewModel : ObservableObject
     public void SetSelected(bool? value, bool propagateToChildren, bool propagateToParent)
     {
         if (_isSelected == value) return;
+        var oldValue = _isSelected;
         _isSelected = value;
         OnPropertyChanged(nameof(IsSelected));
+
+        if (!IsDirectory)
+        {
+            _onLeafSelectionChanged?.Invoke(this, oldValue, value);
+        }
 
         if (propagateToChildren && value.HasValue)
         {
