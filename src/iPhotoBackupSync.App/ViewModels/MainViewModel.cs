@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using iPhotoBackupSync.App.Services;
 using iPhotoBackupSync.Core.Models;
 using iPhotoBackupSync.Core.Services;
 
@@ -16,6 +17,8 @@ public sealed partial class MainViewModel : ObservableObject
     private List<FileNodeViewModel> _topLevelNodes = new();
 
     public ObservableCollection<FileNodeViewModel> FlattenedItems { get; } = new();
+
+    public IReadOnlyList<SortField> SortFields { get; } = Enum.GetValues<SortField>();
 
     [ObservableProperty]
     private string _originPath = string.Empty;
@@ -38,6 +41,21 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private bool _hasResults;
 
+    [ObservableProperty]
+    private string _filterText = string.Empty;
+
+    [ObservableProperty]
+    private DateTime? _filterDateFrom;
+
+    [ObservableProperty]
+    private DateTime? _filterDateTo;
+
+    [ObservableProperty]
+    private SortField _sortField = SortField.Name;
+
+    [ObservableProperty]
+    private bool _sortDescending;
+
     public IRelayCommand BrowseOriginCommand { get; }
     public IRelayCommand BrowseDestinationCommand { get; }
     public IAsyncRelayCommand CompareCommand { get; }
@@ -45,6 +63,9 @@ public sealed partial class MainViewModel : ObservableObject
     public IRelayCommand<FileNodeViewModel> ToggleExpandCommand { get; }
     public IRelayCommand ExpandAllCommand { get; }
     public IRelayCommand CollapseAllCommand { get; }
+    public IRelayCommand SelectAllCommand { get; }
+    public IRelayCommand ClearSelectionCommand { get; }
+    public IRelayCommand ClearFiltersCommand { get; }
     public IAsyncRelayCommand CopySelectedCommand { get; }
     public IRelayCommand ExportCsvCommand { get; }
     public IRelayCommand<FileNodeViewModel> RevealInExplorerCommand { get; }
@@ -57,8 +78,16 @@ public sealed partial class MainViewModel : ObservableObject
         CompareCommand = new AsyncRelayCommand(RunCompareAsync, () => !IsBusy && Directory.Exists(OriginPath));
         CancelCommand = new RelayCommand(() => _cts?.Cancel(), () => IsBusy);
         ToggleExpandCommand = new RelayCommand<FileNodeViewModel>(ToggleExpand);
-        ExpandAllCommand = new RelayCommand(() => SetAllExpanded(true));
-        CollapseAllCommand = new RelayCommand(() => SetAllExpanded(false));
+        ExpandAllCommand = new RelayCommand(() => SetAllExpanded(true), () => HasResults);
+        CollapseAllCommand = new RelayCommand(() => SetAllExpanded(false), () => HasResults);
+        SelectAllCommand = new RelayCommand(() => SetSelectionRecursive(_topLevelNodes, true), () => HasResults);
+        ClearSelectionCommand = new RelayCommand(() => SetSelectionRecursive(_topLevelNodes, false), () => HasResults);
+        ClearFiltersCommand = new RelayCommand(() =>
+        {
+            FilterText = string.Empty;
+            FilterDateFrom = null;
+            FilterDateTo = null;
+        });
         CopySelectedCommand = new AsyncRelayCommand(RunCopySelectedAsync, () => !IsBusy && HasResults);
         ExportCsvCommand = new RelayCommand(ExportCsv, () => HasResults);
         RevealInExplorerCommand = new RelayCommand<FileNodeViewModel>(RevealInExplorer);
@@ -75,8 +104,31 @@ public sealed partial class MainViewModel : ObservableObject
             {
                 CopySelectedCommand.NotifyCanExecuteChanged();
                 ExportCsvCommand.NotifyCanExecuteChanged();
+                ExpandAllCommand.NotifyCanExecuteChanged();
+                CollapseAllCommand.NotifyCanExecuteChanged();
+                SelectAllCommand.NotifyCanExecuteChanged();
+                ClearSelectionCommand.NotifyCanExecuteChanged();
+            }
+            if (e.PropertyName is nameof(FilterText) or nameof(FilterDateFrom) or nameof(FilterDateTo))
+            {
+                OnPropertyChanged(nameof(IsFilterActive));
+                RefreshView();
+            }
+            if (e.PropertyName is nameof(SortField) or nameof(SortDescending))
+            {
+                ApplySort();
+                RefreshView();
             }
         };
+
+        var settings = AppSettingsService.Load();
+        if (!string.IsNullOrWhiteSpace(settings.OriginPath)) OriginPath = settings.OriginPath;
+        if (!string.IsNullOrWhiteSpace(settings.DestinationPath)) DestinationPath = settings.DestinationPath;
+    }
+
+    public void SaveSettings()
+    {
+        AppSettingsService.Save(new AppSettings { OriginPath = OriginPath, DestinationPath = DestinationPath });
     }
 
     private static string? BrowseForFolder(string startPath)
@@ -127,6 +179,7 @@ public sealed partial class MainViewModel : ObservableObject
             StatusMessage = root.MissingFileCount == 0
                 ? "No differences found: everything in the origin folder already exists in the destination."
                 : "Comparison complete.";
+            SaveSettings();
         }
         catch (OperationCanceledException)
         {
@@ -147,20 +200,19 @@ public sealed partial class MainViewModel : ObservableObject
     private void PopulateResults(FileNode root)
     {
         _topLevelNodes = root.Children.Select(c => new FileNodeViewModel(c, null, 0)).ToList();
-
-        FlattenedItems.Clear();
-        foreach (var node in _topLevelNodes)
-        {
-            FlattenedItems.Add(node);
-        }
+        ApplySort();
 
         ResultsSummary = $"{root.MissingFileCount:N0} missing file(s), {FormatBytes(root.MissingSizeBytes)} total";
         HasResults = true;
+
+        RefreshView();
     }
+
+    // --- Expand / collapse -------------------------------------------------
 
     private void ToggleExpand(FileNodeViewModel? node)
     {
-        if (node is null || !node.HasChildren) return;
+        if (node is null || !node.HasChildren || IsFilterActive) return;
 
         if (node.IsExpanded)
         {
@@ -214,21 +266,177 @@ public sealed partial class MainViewModel : ObservableObject
 
     private void SetAllExpanded(bool expanded)
     {
-        FlattenedItems.Clear();
-        void Rebuild(IEnumerable<FileNodeViewModel> nodes)
+        void SetFlags(IEnumerable<FileNodeViewModel> nodes)
         {
             foreach (var node in nodes)
             {
                 node.IsExpanded = expanded && node.HasChildren;
-                FlattenedItems.Add(node);
-                if (node.IsExpanded)
-                {
-                    Rebuild(node.Children);
-                }
+                SetFlags(node.Children);
             }
         }
-        Rebuild(_topLevelNodes);
+        SetFlags(_topLevelNodes);
+        RefreshView();
     }
+
+    // --- Selection -----------------------------------------------------------
+
+    private void SetSelectionRecursive(IEnumerable<FileNodeViewModel> nodes, bool value)
+    {
+        foreach (var node in nodes)
+        {
+            if (node.IsDirectory)
+            {
+                SetSelectionRecursive(node.Children, value);
+            }
+            else if (!IsFilterActive || NodeMatchesFilter(node))
+            {
+                node.SetSelected(value, propagateToChildren: false, propagateToParent: true);
+            }
+        }
+    }
+
+    // --- Filtering -------------------------------------------------------
+
+    public bool IsFilterActive => !string.IsNullOrWhiteSpace(FilterText) || FilterDateFrom.HasValue || FilterDateTo.HasValue;
+
+    private bool NodeMatchesFilter(FileNodeViewModel node)
+    {
+        var nameOk = string.IsNullOrWhiteSpace(FilterText) ||
+                     node.Name.Contains(FilterText, StringComparison.OrdinalIgnoreCase);
+        if (!nameOk) return false;
+
+        if (FilterDateFrom.HasValue || FilterDateTo.HasValue)
+        {
+            var lastModified = node.Node.LastModifiedUtc?.ToLocalTime().Date;
+            if (lastModified is null) return false;
+            if (FilterDateFrom.HasValue && lastModified < FilterDateFrom.Value.Date) return false;
+            if (FilterDateTo.HasValue && lastModified > FilterDateTo.Value.Date) return false;
+        }
+        return true;
+    }
+
+    private bool BuildFilteredList(IEnumerable<FileNodeViewModel> nodes, List<FileNodeViewModel> output)
+    {
+        var anyMatch = false;
+        foreach (var node in nodes)
+        {
+            if (node.IsDirectory)
+            {
+                var folderNameMatches = !string.IsNullOrWhiteSpace(FilterText) &&
+                                         node.Name.Contains(FilterText, StringComparison.OrdinalIgnoreCase);
+
+                if (folderNameMatches && !FilterDateFrom.HasValue && !FilterDateTo.HasValue)
+                {
+                    // The folder itself matches by name and there's no date constraint:
+                    // show it and everything inside without filtering further.
+                    output.Add(node);
+                    AddAllDescendants(node, output);
+                    anyMatch = true;
+                    continue;
+                }
+
+                var childOutput = new List<FileNodeViewModel>();
+                if (BuildFilteredList(node.Children, childOutput))
+                {
+                    output.Add(node);
+                    output.AddRange(childOutput);
+                    anyMatch = true;
+                }
+            }
+            else if (NodeMatchesFilter(node))
+            {
+                output.Add(node);
+                anyMatch = true;
+            }
+        }
+        return anyMatch;
+    }
+
+    private static void AddAllDescendants(FileNodeViewModel node, List<FileNodeViewModel> output)
+    {
+        foreach (var child in node.Children)
+        {
+            output.Add(child);
+            if (child.IsDirectory) AddAllDescendants(child, output);
+        }
+    }
+
+    // --- Sorting -----------------------------------------------------------
+
+    private void ApplySort()
+    {
+        if (_topLevelNodes.Count == 0) return;
+        _topLevelNodes = SortNodesRecursive(_topLevelNodes);
+    }
+
+    private List<FileNodeViewModel> SortNodesRecursive(List<FileNodeViewModel> nodes)
+    {
+        var sorted = SortNodes(nodes);
+        foreach (var node in sorted)
+        {
+            if (node.Children.Count > 0)
+            {
+                var sortedChildren = SortNodesRecursive(node.Children);
+                node.Children.Clear();
+                node.Children.AddRange(sortedChildren);
+            }
+        }
+        return sorted;
+    }
+
+    private List<FileNodeViewModel> SortNodes(List<FileNodeViewModel> nodes)
+    {
+        var query = nodes.OrderBy(n => n.IsDirectory ? 0 : 1);
+        query = SortField switch
+        {
+            SortField.Size => SortDescending
+                ? query.ThenByDescending(n => n.IsDirectory ? n.Node.MissingSizeBytes : n.Node.SizeBytes)
+                : query.ThenBy(n => n.IsDirectory ? n.Node.MissingSizeBytes : n.Node.SizeBytes),
+            SortField.LastModified => SortDescending
+                ? query.ThenByDescending(n => n.Node.LastModifiedUtc ?? DateTime.MinValue)
+                : query.ThenBy(n => n.Node.LastModifiedUtc ?? DateTime.MinValue),
+            SortField.SyncStatus => SortDescending
+                ? query.ThenByDescending(n => (int)n.SyncStatus)
+                : query.ThenBy(n => (int)n.SyncStatus),
+            _ => SortDescending
+                ? query.ThenByDescending(n => n.Name, StringComparer.OrdinalIgnoreCase)
+                : query.ThenBy(n => n.Name, StringComparer.OrdinalIgnoreCase)
+        };
+        return query.ToList();
+    }
+
+    // --- View rebuilding ---------------------------------------------------
+
+    private void RefreshView()
+    {
+        if (IsFilterActive)
+        {
+            var output = new List<FileNodeViewModel>();
+            BuildFilteredList(_topLevelNodes, output);
+            FlattenedItems.Clear();
+            foreach (var n in output) FlattenedItems.Add(n);
+        }
+        else
+        {
+            RebuildNormalView();
+        }
+    }
+
+    private void RebuildNormalView()
+    {
+        FlattenedItems.Clear();
+        void Walk(IEnumerable<FileNodeViewModel> nodes)
+        {
+            foreach (var node in nodes)
+            {
+                FlattenedItems.Add(node);
+                if (node.IsExpanded) Walk(node.Children);
+            }
+        }
+        Walk(_topLevelNodes);
+    }
+
+    // --- Actions -------------------------------------------------------------
 
     private async Task RunCopySelectedAsync()
     {

@@ -77,7 +77,11 @@ dotnet test src/iPhotoBackupSync.Tests/iPhotoBackupSync.Tests.csproj
   exposes a point-in-time placeholder state (in-sync / partially-on-disk /
   placeholder), not a live "% complete" for an in-flight transfer, so
   "Refreshing" is inferred from a partially-hydrated, not-yet-in-sync state
-  rather than guaranteed to reflect an active transfer.
+  rather than guaranteed to reflect an active transfer. A file with no
+  placeholder markers at all (no pending-upload or reparse-point flags) is
+  treated as **Synced**, since cloud providers mark files that still need to
+  be uploaded as "dirty" placeholders immediately -- the absence of any such
+  marker is the normal state for a file that has already finished uploading.
 - Comparison is by **path and structure only** -- it does not compare file
   contents, size, or modified date to detect changes to a file that exists
   on both sides. That keeps scans fast on very large libraries, but it also

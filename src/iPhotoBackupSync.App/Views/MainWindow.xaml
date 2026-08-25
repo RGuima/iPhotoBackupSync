@@ -14,6 +14,7 @@
         <conv:SyncStatusToTextConverter x:Key="SyncStatusToText" />
         <conv:DepthToIndentConverter x:Key="DepthToIndent" />
         <conv:BoolToVisibilityConverter x:Key="BoolToVisibility" />
+        <conv:InverseBooleanConverter x:Key="InverseBoolean" />
 
         <Style x:Key="IconButton" TargetType="Button">
             <Setter Property="Padding" Value="10,5" />
@@ -57,6 +58,7 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -93,13 +95,35 @@
             <Button Content="Expand All" Style="{StaticResource IconButton}" Command="{Binding ExpandAllCommand}" />
             <Button Content="Collapse All" Style="{StaticResource IconButton}" Command="{Binding CollapseAllCommand}" />
             <Separator Width="16" Background="Transparent" />
+            <Button Content="Select All" Style="{StaticResource IconButton}" Command="{Binding SelectAllCommand}" />
+            <Button Content="Clear Selection" Style="{StaticResource IconButton}" Command="{Binding ClearSelectionCommand}" />
+            <Separator Width="16" Background="Transparent" />
             <Button Content="Copy Selected to Destination" Style="{StaticResource IconButton}" Command="{Binding CopySelectedCommand}" />
             <Button Content="Export List (CSV)" Style="{StaticResource IconButton}" Command="{Binding ExportCsvCommand}" />
             <TextBlock Text="{Binding ResultsSummary}" VerticalAlignment="Center" Margin="16,0,0,0" FontWeight="SemiBold" />
         </StackPanel>
 
+        <!-- Filter / sort row -->
+        <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,8">
+            <TextBlock Text="Filter:" VerticalAlignment="Center" />
+            <TextBox Width="220" Margin="6,0,0,0" VerticalAlignment="Center"
+                     Text="{Binding FilterText, UpdateSourceTrigger=PropertyChanged}"
+                     ToolTip="Filter by file/folder name (contains)" />
+            <TextBlock Text="Modified from:" VerticalAlignment="Center" Margin="14,0,0,0" />
+            <DatePicker Width="120" Margin="6,0,0,0" SelectedDate="{Binding FilterDateFrom}" />
+            <TextBlock Text="to:" VerticalAlignment="Center" Margin="10,0,0,0" />
+            <DatePicker Width="120" Margin="6,0,0,0" SelectedDate="{Binding FilterDateTo}" />
+            <Button Content="Clear Filters" Style="{StaticResource IconButton}" Command="{Binding ClearFiltersCommand}" Margin="14,0,0,0" />
+
+            <TextBlock Text="Sort by:" VerticalAlignment="Center" Margin="24,0,0,0" />
+            <ComboBox Width="130" Margin="6,0,0,0" VerticalAlignment="Center"
+                      ItemsSource="{Binding SortFields}" SelectedItem="{Binding SortField}" />
+            <CheckBox Content="Descending" VerticalAlignment="Center" Margin="10,0,0,0"
+                      IsChecked="{Binding SortDescending}" />
+        </StackPanel>
+
         <!-- Results list -->
-        <Border Grid.Row="3" BorderBrush="#33000000" BorderThickness="1">
+        <Border Grid.Row="4" BorderBrush="#33000000" BorderThickness="1">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
@@ -155,6 +179,7 @@
                                 <ToggleButton Grid.Column="1" Style="{StaticResource ExpanderToggle}"
                                               IsChecked="{Binding IsExpanded, Mode=OneWay}"
                                               Visibility="{Binding HasChildren, Converter={StaticResource BoolToVisibility}}"
+                                              IsEnabled="{Binding DataContext.IsFilterActive, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource InverseBoolean}}"
                                               Command="{Binding DataContext.ToggleExpandCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                               CommandParameter="{Binding}" />
 
@@ -193,11 +218,11 @@
         </Border>
 
         <!-- Progress -->
-        <TextBlock Grid.Row="4" Text="{Binding ProgressDetail}" Margin="0,8,0,0" Foreground="#0A84FF" />
-        <ProgressBar Grid.Row="4" Height="4" Margin="0,26,0,0"
+        <TextBlock Grid.Row="5" Text="{Binding ProgressDetail}" Margin="0,8,0,0" Foreground="#0A84FF" />
+        <ProgressBar Grid.Row="5" Height="4" Margin="0,26,0,0"
                      IsIndeterminate="{Binding IsBusy}" Visibility="{Binding IsBusy, Converter={StaticResource BoolToVisibility}}" />
 
         <!-- Status bar -->
-        <TextBlock Grid.Row="5" Text="{Binding StatusMessage}" Margin="0,8,0,0" TextWrapping="Wrap" />
+        <TextBlock Grid.Row="6" Text="{Binding StatusMessage}" Margin="0,8,0,0" TextWrapping="Wrap" />
     </Grid>
 </Window>

@@ -29,7 +29,7 @@ public sealed class CloudSyncStatusProvider
             try
             {
                 var state = NativeMethods.CfGetPlaceholderStateFromFindData(ref findData);
-                return Interpret(state);
+                return Interpret(findData.dwFileAttributes, state);
             }
             finally
             {
@@ -51,35 +51,43 @@ public sealed class CloudSyncStatusProvider
         }
     }
 
-    private static SyncStatus Interpret(CF_PLACEHOLDER_STATE state)
+    private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+
+    private static SyncStatus Interpret(uint fileAttributes, CF_PLACEHOLDER_STATE state)
     {
         if (state.HasFlag(CF_PLACEHOLDER_STATE.INVALID))
         {
             return SyncStatus.Error;
         }
 
-        if (!state.HasFlag(CF_PLACEHOLDER_STATE.PLACEHOLDER))
+        if (state.HasFlag(CF_PLACEHOLDER_STATE.PLACEHOLDER))
         {
-            // Not managed by any cloud sync provider (e.g. a plain local file
-            // added outside iCloud). Treat as not yet backed up to the cloud.
-            return SyncStatus.NotSynced;
+            if (state.HasFlag(CF_PLACEHOLDER_STATE.IN_SYNC))
+            {
+                return SyncStatus.Synced;
+            }
+
+            var partial = state.HasFlag(CF_PLACEHOLDER_STATE.PARTIAL) ||
+                          state.HasFlag(CF_PLACEHOLDER_STATE.PARTIALLY_ON_DISK);
+            return partial ? SyncStatus.Refreshing : SyncStatus.NotSynced;
         }
 
-        var inSync = state.HasFlag(CF_PLACEHOLDER_STATE.IN_SYNC);
-        var partial = state.HasFlag(CF_PLACEHOLDER_STATE.PARTIAL) ||
-                      state.HasFlag(CF_PLACEHOLDER_STATE.PARTIALLY_ON_DISK);
-
-        if (inSync)
+        if ((fileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
         {
-            return SyncStatus.Synced;
+            // Some other kind of reparse point (symlink, junction, ...) that isn't
+            // a cloud placeholder we understand.
+            return SyncStatus.Error;
         }
 
-        if (partial)
-        {
-            return SyncStatus.Refreshing;
-        }
-
-        return SyncStatus.NotSynced;
+        // No placeholder markers at all. Cloud providers (iCloud, OneDrive, Dropbox)
+        // mark a file that still needs to be uploaded with a "dirty" placeholder
+        // immediately, so a plain, fully-hydrated file with no such marker inside a
+        // cloud-managed library is, in practice, one that has already finished
+        // uploading -- some providers drop the placeholder reparse point entirely
+        // once a file is fully downloaded and confirmed in sync. Treating this case
+        // as "not synced" (the previous behavior) made every already-backed-up photo
+        // look unsynced, which is wrong far more often than treating it as synced is.
+        return SyncStatus.Synced;
     }
 
     private static string GetSearchPath(string fullPath)
