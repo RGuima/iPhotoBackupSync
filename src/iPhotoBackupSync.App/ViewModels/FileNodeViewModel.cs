@@ -43,10 +43,20 @@ public sealed partial class FileNodeViewModel : ObservableObject
 
     public SyncStatus SyncStatus => Node.SyncStatus;
 
+    /// <summary>Raises change notification for <see cref="SyncStatus"/> after
+    /// <see cref="Node"/>'s SyncStatus has been updated out-of-band (e.g. by a
+    /// force-sync or manual status refresh), since it isn't itself observable.</summary>
+    public void NotifySyncStatusChanged() => OnPropertyChanged(nameof(SyncStatus));
+
     [ObservableProperty]
     private bool _isExpanded;
 
-    private bool? _isSelected;
+    // Starts unchecked (false), not null/indeterminate -- null is reserved for a
+    // directory whose children are only partially selected. Defaulting a fresh
+    // node to null would make a tri-state CheckBox's *first* click land on
+    // "unchecked" (the automation/click cycle is indeterminate -> unchecked ->
+    // checked), forcing a confusing second click just to actually select it.
+    private bool? _isSelected = false;
     public bool? IsSelected
     {
         get => _isSelected;

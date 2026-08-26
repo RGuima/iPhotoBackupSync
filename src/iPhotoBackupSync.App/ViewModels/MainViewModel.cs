@@ -14,6 +14,8 @@ public sealed partial class MainViewModel : ObservableObject
 {
     private readonly FolderComparer _comparer = new();
     private readonly FileActionService _actionService = new();
+    private readonly CloudSyncForceService _cloudSyncForceService = new();
+    private readonly CloudSyncStatusProvider _syncStatusProvider = new();
     private CancellationTokenSource? _cts;
     private List<FileNodeViewModel> _topLevelNodes = new();
     private List<SortCriterion> _sortCriteria = new() { new SortCriterion(SortField.Name, false) };
@@ -89,6 +91,8 @@ public sealed partial class MainViewModel : ObservableObject
     public IRelayCommand ClearFiltersCommand { get; }
     public IRelayCommand<SortField> SortByColumnCommand { get; }
     public IAsyncRelayCommand CopySelectedCommand { get; }
+    public IAsyncRelayCommand ForceSyncSelectedCommand { get; }
+    public IAsyncRelayCommand RefreshSyncStatusCommand { get; }
     public IRelayCommand ExportCsvCommand { get; }
     public IRelayCommand<FileNodeViewModel> RevealInExplorerCommand { get; }
     public IRelayCommand<FileNodeViewModel> CopyPathCommand { get; }
@@ -115,7 +119,9 @@ public sealed partial class MainViewModel : ObservableObject
             FilterSyncError = false;
         });
         SortByColumnCommand = new RelayCommand<SortField>(SortByColumn, _ => !IsBusy);
-        CopySelectedCommand = new AsyncRelayCommand(RunCopySelectedAsync, () => !IsBusy && HasResults);
+        CopySelectedCommand = new AsyncRelayCommand(RunCopySelectedAsync, CanCopySelected);
+        ForceSyncSelectedCommand = new AsyncRelayCommand(RunForceSyncSelectedAsync, CanForceSyncSelected);
+        RefreshSyncStatusCommand = new AsyncRelayCommand(RunRefreshSyncStatusAsync, () => !IsBusy && HasResults);
         ExportCsvCommand = new RelayCommand(ExportCsv, () => HasResults);
         RevealInExplorerCommand = new RelayCommand<FileNodeViewModel>(RevealInExplorer);
         CopyPathCommand = new RelayCommand<FileNodeViewModel>(CopyPath);
@@ -130,6 +136,8 @@ public sealed partial class MainViewModel : ObservableObject
             if (e.PropertyName is nameof(IsBusy) or nameof(HasResults))
             {
                 CopySelectedCommand.NotifyCanExecuteChanged();
+                ForceSyncSelectedCommand.NotifyCanExecuteChanged();
+                RefreshSyncStatusCommand.NotifyCanExecuteChanged();
                 ExportCsvCommand.NotifyCanExecuteChanged();
                 ExpandAllCommand.NotifyCanExecuteChanged();
                 CollapseAllCommand.NotifyCanExecuteChanged();
@@ -146,6 +154,8 @@ public sealed partial class MainViewModel : ObservableObject
             if (e.PropertyName is nameof(SelectedCount) or nameof(SelectedSizeBytes))
             {
                 OnPropertyChanged(nameof(SelectionSummary));
+                CopySelectedCommand.NotifyCanExecuteChanged();
+                ForceSyncSelectedCommand.NotifyCanExecuteChanged();
             }
         };
 
@@ -331,6 +341,44 @@ public sealed partial class MainViewModel : ObservableObject
             SelectedCount++;
             SelectedSizeBytes += node.Node.SizeBytes;
         }
+    }
+
+    /// <summary>Resolves the current selection down to individual leaf files,
+    /// regardless of whether they were selected directly or via a fully-checked
+    /// parent folder -- needed to inspect each file's own sync status.</summary>
+    private List<FileNodeViewModel> GetSelectedLeafFiles()
+    {
+        var result = new List<FileNodeViewModel>();
+        void Walk(IEnumerable<FileNodeViewModel> nodes)
+        {
+            foreach (var node in nodes)
+            {
+                if (node.IsDirectory)
+                {
+                    if (node.IsSelected == false) continue;
+                    Walk(node.Children);
+                }
+                else if (node.IsSelected == true)
+                {
+                    result.Add(node);
+                }
+            }
+        }
+        Walk(_topLevelNodes);
+        return result;
+    }
+
+    private bool CanCopySelected()
+    {
+        if (IsBusy || !HasResults) return false;
+        var files = GetSelectedLeafFiles();
+        return files.Count > 0 && files.All(f => f.SyncStatus == SyncStatus.Synced);
+    }
+
+    private bool CanForceSyncSelected()
+    {
+        if (IsBusy || !HasResults) return false;
+        return GetSelectedLeafFiles().Any(f => f.SyncStatus != SyncStatus.Synced);
     }
 
     private void SetSelectionRecursive(IEnumerable<FileNodeViewModel> nodes, bool value)
@@ -571,6 +619,18 @@ public sealed partial class MainViewModel : ObservableObject
             return;
         }
 
+        // Defense in depth: CanCopySelected already gates the command/button, but
+        // re-check here too so a copy can never start against a file that isn't
+        // fully synced yet -- backing up a placeholder/partial file would be worse
+        // than not backing it up at all.
+        var notSynced = GetSelectedLeafFiles().Where(f => f.SyncStatus != SyncStatus.Synced).ToList();
+        if (notSynced.Count > 0)
+        {
+            StatusMessage = $"Copy blocked: {notSynced.Count:N0} of the selected file(s) aren't fully synced with iCloud yet. " +
+                             "Use Force Sync (or wait), then Refresh Sync Status, before copying.";
+            return;
+        }
+
         if (!Directory.Exists(DestinationPath))
         {
             var result = System.Windows.MessageBox.Show(
@@ -614,6 +674,114 @@ public sealed partial class MainViewModel : ObservableObject
             IsBusy = false;
             ProgressDetail = string.Empty;
             _cts = null;
+        }
+    }
+
+    private async Task RunForceSyncSelectedAsync()
+    {
+        var targets = GetSelectedLeafFiles().Where(f => f.SyncStatus != SyncStatus.Synced).ToList();
+        if (targets.Count == 0)
+        {
+            StatusMessage = "All selected files are already synced.";
+            return;
+        }
+
+        IsBusy = true;
+        _cts = new CancellationTokenSource();
+        var progress = new Progress<string>(msg => ProgressDetail = msg);
+
+        try
+        {
+            var paths = targets.Select(f => f.Node.FullPath).ToList();
+            await Task.Run(() => _cloudSyncForceService.ForceSyncAsync(paths, progress, _cts.Token), _cts.Token);
+
+            // Re-check right away: this typically flips a file from "Not synced" to
+            // "Refreshing" once iCloud picks up the request, confirming it actually
+            // started rather than leaving stale status on screen.
+            await Task.Run(() =>
+            {
+                foreach (var target in targets)
+                {
+                    target.Node.SyncStatus = _syncStatusProvider.GetStatus(target.Node.FullPath);
+                }
+            }, _cts.Token);
+
+            foreach (var target in targets)
+            {
+                target.NotifySyncStatusChanged();
+            }
+
+            StatusMessage = $"Requested a fresh iCloud sync for {targets.Count:N0} file(s). " +
+                             "Use Refresh Sync Status again in a moment to see when they're done.";
+        }
+        catch (OperationCanceledException)
+        {
+            StatusMessage = "Force sync canceled.";
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Force sync failed: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+            ProgressDetail = string.Empty;
+            _cts = null;
+            CopySelectedCommand.NotifyCanExecuteChanged();
+            ForceSyncSelectedCommand.NotifyCanExecuteChanged();
+        }
+    }
+
+    private async Task RunRefreshSyncStatusAsync()
+    {
+        var allFiles = new List<FileNodeViewModel>();
+        void Walk(IEnumerable<FileNodeViewModel> nodes)
+        {
+            foreach (var node in nodes)
+            {
+                if (node.IsDirectory) Walk(node.Children);
+                else allFiles.Add(node);
+            }
+        }
+        Walk(_topLevelNodes);
+
+        if (allFiles.Count == 0)
+        {
+            StatusMessage = "No missing files to check.";
+            return;
+        }
+
+        IsBusy = true;
+        _cts = new CancellationTokenSource();
+        ProgressDetail = $"Checking sync status for {allFiles.Count:N0} file(s)...";
+
+        try
+        {
+            await Task.Run(() =>
+            {
+                Parallel.ForEach(allFiles,
+                    new ParallelOptions { CancellationToken = _cts.Token, MaxDegreeOfParallelism = 8 },
+                    f => f.Node.SyncStatus = _syncStatusProvider.GetStatus(f.Node.FullPath));
+            }, _cts.Token);
+
+            foreach (var f in allFiles)
+            {
+                f.NotifySyncStatusChanged();
+            }
+
+            StatusMessage = "Sync status refreshed.";
+        }
+        catch (OperationCanceledException)
+        {
+            StatusMessage = "Refresh canceled.";
+        }
+        finally
+        {
+            IsBusy = false;
+            ProgressDetail = string.Empty;
+            _cts = null;
+            CopySelectedCommand.NotifyCanExecuteChanged();
+            ForceSyncSelectedCommand.NotifyCanExecuteChanged();
         }
     }
 

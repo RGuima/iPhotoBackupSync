@@ -122,7 +122,13 @@
             <Button Content="Select All" Style="{StaticResource IconButton}" Command="{Binding SelectAllCommand}" />
             <Button Content="Clear Selection" Style="{StaticResource IconButton}" Command="{Binding ClearSelectionCommand}" />
             <Separator Width="16" Background="Transparent" />
-            <Button Content="Copy Selected to Destination" Style="{StaticResource IconButton}" Command="{Binding CopySelectedCommand}" />
+            <Button Content="Force Sync Selected" Style="{StaticResource IconButton}" Command="{Binding ForceSyncSelectedCommand}"
+                    ToolTip="Ask iCloud to sync the selected not-yet-synced file(s) right now, instead of waiting for its own schedule." />
+            <Button Content="Refresh Sync Status" Style="{StaticResource IconButton}" Command="{Binding RefreshSyncStatusCommand}"
+                    ToolTip="Re-check cloud sync status for the missing files without a full re-compare." />
+            <Separator Width="16" Background="Transparent" />
+            <Button Content="Copy Selected to Destination" Style="{StaticResource IconButton}" Command="{Binding CopySelectedCommand}"
+                    ToolTip="Only enabled once every selected file is fully synced with iCloud, so a partial/placeholder file never gets backed up." />
             <Button Content="Export List (CSV)" Style="{StaticResource IconButton}" Command="{Binding ExportCsvCommand}" />
             <TextBlock Text="{Binding ResultsSummary}" VerticalAlignment="Center" Margin="16,0,0,0" FontWeight="SemiBold" />
             <TextBlock Text="{Binding SelectionSummary}" VerticalAlignment="Center" Margin="16,0,0,0" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" />
@@ -211,6 +217,7 @@
 
                                 <CheckBox Grid.Column="0" IsThreeState="True"
                                           IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                          AutomationProperties.Name="{Binding RelativePath}"
                                           VerticalAlignment="Center" HorizontalAlignment="Center" />
 
                                 <ToggleButton Grid.Column="1" Style="{StaticResource ExpanderToggle}"

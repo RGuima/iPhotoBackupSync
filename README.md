@@ -23,12 +23,27 @@ across tens of thousands of files.
   - **Not synced** -- local changes not yet uploaded, or not a cloud file
   - **Error** -- status could not be determined
 - **Selectable results** with a checkbox tree (tri-state: select a whole
-  folder or individual files) and a right-click menu.
+  folder or individual files), Select All / Clear Selection, and a live
+  selected-count-and-size summary. A right-click menu gives per-file actions.
+- **Filter and sort**: filter the results by name, last-modified date range,
+  and/or cloud sync status (any combination) -- combine a sync-status filter
+  with Select All to select e.g. "everything not yet synced" in one click.
+  Click a column header to sort by it (click again to reverse); Shift+click
+  another header to add it as a secondary/tertiary sort level.
+- **Force Sync**: for selected files that aren't fully synced yet, asks
+  iCloud to sync them right now instead of waiting for its own schedule
+  (restarts the iCloud client process(es) and pins the files). Refresh Sync
+  Status re-checks status afterward without a full re-compare.
 - **Actions** on the current selection:
   - Copy selected files to the destination (preserving relative folder
-    structure; never modifies or deletes anything in the origin)
+    structure; never modifies or deletes anything in the origin). Only
+    enabled once every selected file is fully synced with iCloud, so a
+    partial/placeholder file never gets backed up -- Copy re-runs Compare
+    automatically afterward to refresh the list.
   - Export the full missing-file list to CSV
   - Reveal a file in File Explorer / copy its full path
+- The last-used origin and destination folders are remembered across
+  sessions.
 - Works with local paths and NAS/UNC paths (`\\server\share\...`) for both
   origin and destination.
 
@@ -100,3 +115,8 @@ dotnet test src/iPhotoBackupSync.Tests/iPhotoBackupSync.Tests.csproj
 - The "Copy Selected to Destination" action copies files; it never deletes
   or overwrites files in the origin, and it will prompt before creating a
   destination folder that doesn't exist yet.
+- **Force Sync restarts the detected iCloud process(es)** (iCloud Photos /
+  iCloud Drive / iCloud Services) and pins the target files (`attrib +P -U`),
+  the same mechanism as the standalone "Cloud Sync Forcer" tool -- this is a
+  deliberate, occasional action the user triggers, not something run
+  automatically, since it briefly interrupts those processes system-wide.
