@@ -42,6 +42,16 @@ across tens of thousands of files.
     automatically afterward to refresh the list.
   - Export the full missing-file list to CSV
   - Reveal a file in File Explorer / copy its full path
+- **Backup manifest**: a destination folder can hold a plain-text
+  `iPhotoBackupSync.manifest.txt` file recording files that should count as
+  already backed up even though the bytes themselves aren't (or are no
+  longer) sitting in that folder -- for example, photos you copied out to an
+  archive drive or optical media afterwards. Compare reads this file
+  automatically and treats every relative path it lists (and the file's
+  parent folders) as present. **Generate Manifest for Folder...** creates or
+  overwrites this file for any folder you pick, recording every file that
+  currently exists in it (relative path, size, last-modified date) -- handy
+  for stamping an existing archive as "already backed up" in one click.
 - The last-used origin and destination folders are remembered across
   sessions.
 - Works with local paths and NAS/UNC paths (`\\server\share\...`) for both
@@ -115,6 +125,12 @@ dotnet test src/iPhotoBackupSync.Tests/iPhotoBackupSync.Tests.csproj
 - The "Copy Selected to Destination" action copies files; it never deletes
   or overwrites files in the origin, and it will prompt before creating a
   destination folder that doesn't exist yet.
+- **The manifest is matched by relative path only**, the same signal used to
+  detect a file's presence in the destination generally -- it does not
+  record or check file contents, size, or modified date for equality (the
+  size/date columns are written for human reference only). Deleting a line,
+  or the whole `iPhotoBackupSync.manifest.txt` file, makes those files show
+  up as missing again on the next Compare.
 - **Force Sync restarts the detected iCloud process(es)** (iCloud Photos /
   iCloud Drive / iCloud Services) and pins the target files (`attrib +P -U`),
   the same mechanism as the standalone "Cloud Sync Forcer" tool -- this is a

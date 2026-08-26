@@ -130,6 +130,9 @@
             <Button Content="Copy Selected to Destination" Style="{StaticResource IconButton}" Command="{Binding CopySelectedCommand}"
                     ToolTip="Only enabled once every selected file is fully synced with iCloud, so a partial/placeholder file never gets backed up." />
             <Button Content="Export List (CSV)" Style="{StaticResource IconButton}" Command="{Binding ExportCsvCommand}" />
+            <Separator Width="16" Background="Transparent" />
+            <Button Content="Generate Manifest for Folder..." Style="{StaticResource IconButton}" Command="{Binding GenerateManifestCommand}"
+                    ToolTip="Pick a folder and record every file already in it as 'backed up', so Compare treats them as present even if the files are later archived elsewhere." />
             <TextBlock Text="{Binding ResultsSummary}" VerticalAlignment="Center" Margin="16,0,0,0" FontWeight="SemiBold" />
             <TextBlock Text="{Binding SelectionSummary}" VerticalAlignment="Center" Margin="16,0,0,0" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" />
         </StackPanel>

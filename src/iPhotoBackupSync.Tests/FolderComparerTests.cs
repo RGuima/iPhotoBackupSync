@@ -103,4 +103,20 @@ public sealed class FolderComparerTests : IDisposable
 
         Assert.Equal(1, result.MissingFileCount);
     }
+
+    [Fact]
+    public async Task FileRecordedInManifest_IsNotReportedMissing()
+    {
+        WriteOrigin("SubA/archived.jpg");
+        WriteOrigin("SubA/still-missing.jpg");
+        File.WriteAllText(
+            Path.Combine(_destination, BackupManifestService.ManifestFileName),
+            "# comment line, ignored\nSubA\\archived.jpg\t123\t2024-01-01T00:00:00Z\n");
+
+        var comparer = new FolderComparer();
+        var result = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
+
+        var missing = FlattenFiles(result).Select(f => f.RelativePath).OrderBy(x => x).ToList();
+        Assert.Equal(new[] { "SubA\\still-missing.jpg" }, missing);
+    }
 }

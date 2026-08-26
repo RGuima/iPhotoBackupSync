@@ -16,6 +16,7 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly FileActionService _actionService = new();
     private readonly CloudSyncForceService _cloudSyncForceService = new();
     private readonly CloudSyncStatusProvider _syncStatusProvider = new();
+    private readonly BackupManifestService _manifestService = new();
     private CancellationTokenSource? _cts;
     private List<FileNodeViewModel> _topLevelNodes = new();
     private List<SortCriterion> _sortCriteria = new() { new SortCriterion(SortField.Name, false) };
@@ -96,6 +97,7 @@ public sealed partial class MainViewModel : ObservableObject
     public IRelayCommand ExportCsvCommand { get; }
     public IRelayCommand<FileNodeViewModel> RevealInExplorerCommand { get; }
     public IRelayCommand<FileNodeViewModel> CopyPathCommand { get; }
+    public IAsyncRelayCommand GenerateManifestCommand { get; }
 
     public MainViewModel()
     {
@@ -125,6 +127,7 @@ public sealed partial class MainViewModel : ObservableObject
         ExportCsvCommand = new RelayCommand(ExportCsv, () => HasResults);
         RevealInExplorerCommand = new RelayCommand<FileNodeViewModel>(RevealInExplorer);
         CopyPathCommand = new RelayCommand<FileNodeViewModel>(CopyPath);
+        GenerateManifestCommand = new AsyncRelayCommand(RunGenerateManifestAsync, () => !IsBusy);
 
         PropertyChanged += (_, e) =>
         {
@@ -132,6 +135,10 @@ public sealed partial class MainViewModel : ObservableObject
             {
                 CompareCommand.NotifyCanExecuteChanged();
                 CancelCommand.NotifyCanExecuteChanged();
+            }
+            if (e.PropertyName is nameof(IsBusy))
+            {
+                GenerateManifestCommand.NotifyCanExecuteChanged();
             }
             if (e.PropertyName is nameof(IsBusy) or nameof(HasResults))
             {
@@ -782,6 +789,41 @@ public sealed partial class MainViewModel : ObservableObject
             _cts = null;
             CopySelectedCommand.NotifyCanExecuteChanged();
             ForceSyncSelectedCommand.NotifyCanExecuteChanged();
+        }
+    }
+
+    private async Task RunGenerateManifestAsync()
+    {
+        var folder = BrowseForFolder(DestinationPath);
+        if (folder is null) return;
+
+        IsBusy = true;
+        _cts = new CancellationTokenSource();
+        var progress = new Progress<int>(count => ProgressDetail = $"Scanning existing files... {count:N0} found so far");
+
+        try
+        {
+            var count = await Task.Run(
+                () => _manifestService.GenerateManifestAsync(folder, progress, _cts.Token), _cts.Token);
+
+            StatusMessage = count == 0
+                ? $"No files found in \"{folder}\" -- no manifest was written."
+                : $"Recorded {count:N0} file(s) already in \"{folder}\" as backed up ({BackupManifestService.ManifestFileName}). " +
+                  "Compare will now treat those files as present even if they're later moved elsewhere.";
+        }
+        catch (OperationCanceledException)
+        {
+            StatusMessage = "Manifest generation canceled.";
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Manifest generation failed: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+            ProgressDetail = string.Empty;
+            _cts = null;
         }
     }
 

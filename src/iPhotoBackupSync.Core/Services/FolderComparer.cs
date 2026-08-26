@@ -16,6 +16,7 @@ namespace iPhotoBackupSync.Core.Services;
 public sealed class FolderComparer
 {
     private readonly CloudSyncStatusProvider _syncStatusProvider = new();
+    private readonly BackupManifestService _manifestService = new();
 
     /// <summary>Max concurrent directory-listing operations. Kept modest by default so a
     /// NAS isn't hammered; local disks would tolerate a higher number too.</summary>
@@ -60,6 +61,14 @@ public sealed class FolderComparer
             await IndexDirectoryAsync(destinationRoot, destinationRoot, destinationIndex, indexGate,
                 () => { Interlocked.Increment(ref dirsScanned); ReportProgress(ComparePhase.IndexingDestination, destinationRoot); },
                 cancellationToken);
+        }
+
+        // Files (and their ancestor folders) recorded in a backup manifest at the
+        // destination root count as already backed up even if the bytes aren't
+        // actually there -- e.g. archived elsewhere after the fact.
+        foreach (var manifestPath in _manifestService.ReadManifestPaths(destinationRoot))
+        {
+            destinationIndex[manifestPath] = 0;
         }
 
         // Phase 2: walk the origin tree, keeping only nodes that are missing from the
