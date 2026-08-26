@@ -13,6 +13,14 @@ namespace iPhotoBackupSync.Core.Services;
 /// signal <see cref="FolderComparer"/> already uses to decide whether a file exists
 /// in the destination (path/structure only, not content).
 /// </summary>
+/// <summary>
+/// Result of a manifest generation pass: <paramref name="TotalEntries"/> is the full
+/// entry count after merging, <paramref name="NewEntries"/> is how many of those were
+/// added in this pass, and <paramref name="PreviousEntries"/> is how many existed
+/// before this pass ran (all of which are still present -- none are ever removed).
+/// </summary>
+public readonly record struct ManifestGenerationResult(int TotalEntries, int NewEntries, int PreviousEntries);
+
 public sealed class BackupManifestService
 {
     public const string ManifestFileName = "iPhotoBackupSync.manifest.txt";
@@ -57,12 +65,14 @@ public sealed class BackupManifestService
     }
 
     /// <summary>
-    /// Scans every file currently in <paramref name="folderRoot"/> (recursively) and
-    /// (re)writes the manifest file at its root to record all of them. Use this to mark
-    /// an entire folder's existing contents as "already backed up" -- for example, a
-    /// batch of files that were manually moved to an archive drive.
+    /// Scans every file currently in <paramref name="folderRoot"/> (recursively) and adds
+    /// each one to the manifest file at its root, creating the file if it doesn't exist
+    /// yet. This only ever adds or refreshes entries for files that are still physically
+    /// present -- it never removes an existing entry, even one for a file no longer found
+    /// in this scan (e.g. because it was archived elsewhere after being recorded), since
+    /// that entry may be the only remaining record that the file was ever backed up.
     /// </summary>
-    public async Task<int> GenerateManifestAsync(
+    public async Task<ManifestGenerationResult> GenerateManifestAsync(
         string folderRoot,
         IProgress<int>? progress,
         CancellationToken cancellationToken)
@@ -70,22 +80,39 @@ public sealed class BackupManifestService
         folderRoot = Path.GetFullPath(folderRoot);
         var manifestPath = Path.Combine(folderRoot, ManifestFileName);
 
-        var entries = new ConcurrentBag<ManifestEntry>();
+        var merged = new Dictionary<string, ManifestEntry>(StringComparer.OrdinalIgnoreCase);
+        foreach (var existing in ReadRawEntries(manifestPath))
+        {
+            merged[existing.RelativePath] = existing;
+        }
+        var previousCount = merged.Count;
+
+        var scannedEntries = new ConcurrentBag<ManifestEntry>();
         long scanned = 0;
         using var gate = new SemaphoreSlim(MaxDegreeOfParallelism);
 
-        await CollectEntriesAsync(folderRoot, folderRoot, manifestPath, entries, gate,
+        await CollectEntriesAsync(folderRoot, folderRoot, manifestPath, scannedEntries, gate,
             () => progress?.Report((int)Interlocked.Increment(ref scanned)),
             cancellationToken);
 
-        var sorted = entries.OrderBy(e => e.RelativePath, StringComparer.OrdinalIgnoreCase).ToList();
+        // Add newly found files and refresh size/date for ones already recorded that are
+        // still present; entries for files not seen in this scan are left untouched.
+        var newCount = 0;
+        foreach (var entry in scannedEntries)
+        {
+            if (!merged.ContainsKey(entry.RelativePath)) newCount++;
+            merged[entry.RelativePath] = entry;
+        }
+
+        var sorted = merged.Values.OrderBy(e => e.RelativePath, StringComparer.OrdinalIgnoreCase).ToList();
 
         var sb = new StringBuilder();
         sb.AppendLine("# iPhotoBackupSync manifest -- files considered already backed up in this folder,");
         sb.AppendLine("# even though the file itself may not be present here (e.g. archived elsewhere).");
         sb.AppendLine("# Delete a line (or this whole file) to make iPhotoBackupSync treat that file as");
-        sb.AppendLine("# missing again the next time you Compare.");
-        sb.AppendLine(CultureInfo.InvariantCulture, $"# Generated {DateTime.UtcNow:O}");
+        sb.AppendLine("# missing again the next time you Compare. Regenerating this file only ever adds");
+        sb.AppendLine("# or refreshes entries -- it never removes one for a file it doesn't currently see.");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"# Last generated {DateTime.UtcNow:O}");
         sb.AppendLine("# RelativePath\tSizeBytes\tLastModifiedUtc");
         foreach (var entry in sorted)
         {
@@ -96,7 +123,35 @@ public sealed class BackupManifestService
         }
 
         await File.WriteAllTextAsync(manifestPath, sb.ToString(), Encoding.UTF8, cancellationToken);
-        return sorted.Count;
+        return new ManifestGenerationResult(sorted.Count, newCount, previousCount);
+    }
+
+    private static List<ManifestEntry> ReadRawEntries(string manifestPath)
+    {
+        var result = new List<ManifestEntry>();
+        if (!File.Exists(manifestPath)) return result;
+
+        foreach (var line in File.ReadLines(manifestPath))
+        {
+            if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith('#')) continue;
+
+            var parts = line.Split('\t');
+            var relativePath = parts[0].Trim();
+            if (relativePath.Length == 0) continue;
+
+            long size = 0;
+            if (parts.Length > 1) long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out size);
+
+            DateTime? modified = null;
+            if (parts.Length > 2 && DateTime.TryParse(parts[2], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsed))
+            {
+                modified = parsed;
+            }
+
+            result.Add(new ManifestEntry(relativePath, size, modified));
+        }
+
+        return result;
     }
 
     private readonly record struct ManifestEntry(string RelativePath, long SizeBytes, DateTime? LastModifiedUtc);

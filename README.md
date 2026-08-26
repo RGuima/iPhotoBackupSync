@@ -48,10 +48,13 @@ across tens of thousands of files.
   longer) sitting in that folder -- for example, photos you copied out to an
   archive drive or optical media afterwards. Compare reads this file
   automatically and treats every relative path it lists (and the file's
-  parent folders) as present. **Generate Manifest for Folder...** creates or
-  overwrites this file for any folder you pick, recording every file that
-  currently exists in it (relative path, size, last-modified date) -- handy
-  for stamping an existing archive as "already backed up" in one click.
+  parent folders) as present. **Generate Manifest for Folder...** creates
+  this file for any folder you pick (or updates it if one is already there),
+  recording every file that currently exists in it (relative path, size,
+  last-modified date) -- handy for stamping an existing archive as "already
+  backed up" in one click. Regenerating only ever adds or refreshes entries;
+  it never deletes one for a file the scan doesn't currently see, since that
+  file may have since been moved to a different archive.
 - The last-used origin and destination folders are remembered across
   sessions.
 - Works with local paths and NAS/UNC paths (`\\server\share\...`) for both

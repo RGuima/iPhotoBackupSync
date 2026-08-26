@@ -803,13 +803,15 @@ public sealed partial class MainViewModel : ObservableObject
 
         try
         {
-            var count = await Task.Run(
+            var result = await Task.Run(
                 () => _manifestService.GenerateManifestAsync(folder, progress, _cts.Token), _cts.Token);
 
-            StatusMessage = count == 0
+            StatusMessage = result.TotalEntries == 0
                 ? $"No files found in \"{folder}\" -- no manifest was written."
-                : $"Recorded {count:N0} file(s) already in \"{folder}\" as backed up ({BackupManifestService.ManifestFileName}). " +
-                  "Compare will now treat those files as present even if they're later moved elsewhere.";
+                : $"Recorded {result.NewEntries:N0} new file(s) as backed up in \"{folder}\" " +
+                  $"({result.TotalEntries:N0} total in {BackupManifestService.ManifestFileName}" +
+                  (result.PreviousEntries > 0 ? $", {result.PreviousEntries:N0} kept from before" : string.Empty) +
+                  "). Compare will now treat those files as present even if they're later moved elsewhere.";
         }
         catch (OperationCanceledException)
         {

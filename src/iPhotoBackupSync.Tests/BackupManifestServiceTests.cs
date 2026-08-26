@@ -26,9 +26,11 @@ public sealed class BackupManifestServiceTests : IDisposable
         File.WriteAllText(Path.Combine(_root, "Sub", "b.jpg"), "yy");
 
         var service = new BackupManifestService();
-        var count = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
+        var result = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
 
-        Assert.Equal(2, count);
+        Assert.Equal(2, result.TotalEntries);
+        Assert.Equal(2, result.NewEntries);
+        Assert.Equal(0, result.PreviousEntries);
         var manifestPath = Path.Combine(_root, BackupManifestService.ManifestFileName);
         Assert.True(File.Exists(manifestPath));
 
@@ -47,6 +49,31 @@ public sealed class BackupManifestServiceTests : IDisposable
 
         var recorded = service.ReadManifestPaths(_root);
         Assert.DoesNotContain(BackupManifestService.ManifestFileName, recorded);
+    }
+
+    [Fact]
+    public async Task GenerateManifest_RerunAfterFileArchivedElsewhere_KeepsItsEntry()
+    {
+        var service = new BackupManifestService();
+        var pathA = Path.Combine(_root, "a.jpg");
+        File.WriteAllText(pathA, "x");
+
+        var first = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
+        Assert.Equal(1, first.TotalEntries);
+
+        // Simulate the file being moved off to an archive drive, plus a new file arriving.
+        File.Delete(pathA);
+        File.WriteAllText(Path.Combine(_root, "b.jpg"), "yy");
+
+        var second = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
+
+        Assert.Equal(1, second.PreviousEntries);
+        Assert.Equal(1, second.NewEntries);
+        Assert.Equal(2, second.TotalEntries);
+
+        var recorded = service.ReadManifestPaths(_root);
+        Assert.Contains("a.jpg", recorded); // never removed, even though it's gone from disk
+        Assert.Contains("b.jpg", recorded);
     }
 
     [Fact]
