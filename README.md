@@ -59,6 +59,19 @@ across tens of thousands of files.
   sessions.
 - Works with local paths and NAS/UNC paths (`\\server\share\...`) for both
   origin and destination.
+- **Command-line mode** -- run `iPhotoBackupSync.exe <origin> <destination>`
+  to drive the whole workflow unattended, with progress printed to the
+  console (it attaches to the parent console if launched from one, e.g. a
+  terminal or Task Scheduler, or opens its own console window otherwise):
+  it compares the two folders, requests an iCloud sync (one file at a time,
+  not in parallel) for every missing file that isn't already synced, then
+  polls sync status until every missing file is synced or up to one hour
+  has passed -- whichever comes first -- and copies whatever has become
+  synced by then to the destination. The destination's backup manifest is
+  always regenerated at the end of a command-line run, the same as clicking
+  **Generate Manifest for Folder...** would -- this step is never skipped
+  just because the run is unattended. Running with no arguments launches
+  the normal desktop UI, as before.
 
 ## Project layout
 
