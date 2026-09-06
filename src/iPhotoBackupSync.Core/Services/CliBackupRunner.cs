@@ -6,13 +6,14 @@ namespace iPhotoBackupSync.Core.Services;
 /// Headless equivalent of the UI's Compare -> Force Sync -> wait -> Copy -> Generate
 /// Manifest workflow, for running iPhoto Backup Sync unattended from the command line.
 /// Files are force-synced one at a time (the same way <see cref="CloudSyncForceService"/>
-/// already requests iCloud syncs sequentially rather than concurrently), then sync
-/// status is polled until every missing file is synced or <see cref="MaxWaitForSync"/>
-/// elapses, whichever comes first -- at which point whatever has become available is
-/// copied to the destination. The destination's backup manifest is always regenerated
-/// at the end, exactly as the UI's "Generate Manifest for Folder..." action would --
-/// an unattended run must never skip that step just because there's no one there to
-/// click the button.
+/// already requests iCloud syncs sequentially rather than concurrently). Sync status is
+/// then polled repeatedly, copying each batch of newly-synced files to the destination
+/// as soon as it finishes -- rather than waiting for every missing file to finish
+/// syncing before copying anything -- until every file has been copied or
+/// <see cref="MaxWaitForSync"/> elapses, whichever comes first. The destination's
+/// backup manifest is always regenerated at the end, exactly as the UI's "Generate
+/// Manifest for Folder..." action would -- an unattended run must never skip that step
+/// just because there's no one there to click the button.
 /// </summary>
 public sealed class CliBackupRunner
 {
@@ -60,51 +61,59 @@ public sealed class CliBackupRunner
                 await _forceService.ForceSyncAsync(needsSync.Select(f => f.FullPath).ToList(), progress, cancellationToken);
             }
 
+            // Copy files as soon as each one finishes syncing rather than waiting for the
+            // whole batch -- on a large library, plenty of missing files are often already
+            // synced immediately (nothing to wait on at all), and others finish syncing at
+            // different times while this loop is still waiting on the rest.
+            var pending = new List<FileNode>(missingFiles);
+            var copiedTotal = 0;
             var deadline = DateTime.UtcNow + MaxWaitForSync;
+
             while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                foreach (var file in missingFiles)
+                foreach (var file in pending)
                 {
                     file.SyncStatus = _statusProvider.GetStatus(file.FullPath);
                 }
 
-                var remaining = missingFiles.Count(f => f.SyncStatus != SyncStatus.Synced);
-                if (remaining == 0)
+                var readyNow = pending.Where(f => f.SyncStatus == SyncStatus.Synced).ToList();
+                if (readyNow.Count > 0)
                 {
-                    progress.Report("All missing files are now synced with iCloud.");
+                    if (!Directory.Exists(destinationRoot))
+                    {
+                        Directory.CreateDirectory(destinationRoot);
+                    }
+
+                    progress.Report($"{readyNow.Count:N0} file(s) just finished syncing -- copying them now...");
+                    var copyProgress = new RelayProgress<(int copied, int total, string currentPath)>(
+                        p => progress.Report($"Copied {p.copied:N0}/{p.total:N0}: {p.currentPath}"));
+                    await _actionService.CopyToDestinationAsync(readyNow, originRoot, destinationRoot, copyProgress, cancellationToken);
+
+                    copiedTotal += readyNow.Count;
+                    pending.RemoveAll(f => f.SyncStatus == SyncStatus.Synced);
+                }
+
+                if (pending.Count == 0)
+                {
+                    progress.Report("All missing files have been synced and copied.");
                     break;
                 }
 
                 if (DateTime.UtcNow >= deadline)
                 {
                     progress.Report($"Gave up waiting after {MaxWaitForSync.TotalMinutes:N0} minute(s) -- " +
-                                     $"{remaining:N0} file(s) still aren't synced. Copying whatever is ready.");
+                                     $"{pending.Count:N0} file(s) still aren't synced; they'll be picked up on the next run.");
                     break;
                 }
 
-                progress.Report($"{remaining:N0} file(s) still syncing; checking again in {PollInterval.TotalSeconds:N0}s...");
+                progress.Report($"{pending.Count:N0} file(s) still syncing; checking again in {PollInterval.TotalSeconds:N0}s...");
                 await Task.Delay(PollInterval, cancellationToken);
             }
 
-            var readyToCopy = missingFiles.Where(f => f.SyncStatus == SyncStatus.Synced).ToList();
-            if (readyToCopy.Count == 0)
-            {
-                progress.Report("No files were synced in time -- nothing copied.");
-            }
-            else
-            {
-                if (!Directory.Exists(destinationRoot))
-                {
-                    Directory.CreateDirectory(destinationRoot);
-                }
-
-                progress.Report($"Copying {readyToCopy.Count:N0} synced file(s) to the destination...");
-                var copyProgress = new RelayProgress<(int copied, int total, string currentPath)>(
-                    p => progress.Report($"Copied {p.copied:N0}/{p.total:N0}: {p.currentPath}"));
-                await _actionService.CopyToDestinationAsync(readyToCopy, originRoot, destinationRoot, copyProgress, cancellationToken);
-                progress.Report($"Copied {readyToCopy.Count:N0} file(s) to \"{destinationRoot}\".");
-            }
+            progress.Report(copiedTotal == 0
+                ? "No files were synced in time -- nothing copied."
+                : $"Copied {copiedTotal:N0} file(s) total to \"{destinationRoot}\".");
         }
 
         progress.Report("Updating the backup manifest for the destination folder...");
