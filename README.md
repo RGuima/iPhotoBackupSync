@@ -15,12 +15,13 @@ across tens of thousands of files.
 - **Folder comparison** -- recursively finds files/folders present in the
   origin but absent from the destination, and shows totals (missing file
   count, missing size) per folder.
-- **iCloud sync status** -- for every missing file, shows one of four states
-  using the Windows Cloud Filter API (the same mechanism iCloud for Windows,
-  OneDrive, and Dropbox use for on-demand files):
-  - **Refreshing** -- currently being uploaded/downloaded/hydrated
+- **iCloud sync status** -- for every missing file, checks only the marker
+  iCloud for Windows itself sets on a file (not the Windows Cloud Filter API
+  reparse-point mechanism other providers like OneDrive use), so a folder
+  that also happens to fall under a different provider's sync scope doesn't
+  affect the result. Shows one of these states:
+  - **Refreshing** -- currently being uploaded/downloaded/hydrated by iCloud
   - **Synced** -- fully backed up to iCloud
-  - **Not synced** -- local changes not yet uploaded, or not a cloud file
   - **Error** -- status could not be determined
 - **Selectable results** with a checkbox tree (tri-state: select a whole
   folder or individual files), Select All / Clear Selection, and a live
@@ -114,25 +115,22 @@ dotnet test src/iPhotoBackupSync.Tests/iPhotoBackupSync.Tests.csproj
 
 ## Notes & limitations
 
-- **iCloud sync status uses two different OS signals, chosen based on what a
-  real iCloud Photos folder actually reports.** Sampling a real 52,000+ file
-  "iCloud Photos" folder showed that iCloud for Windows does **not** use the
-  Windows Cloud Filter API's reparse-point placeholders (`cldapi.dll`) at all
-  -- every file came back `CF_PLACEHOLDER_STATE_NO_STATES`. Instead it marks
-  files with the lighter-weight cloud-file *attribute* bits: a file with
+- **iCloud sync status intentionally checks only iCloud's own marker, not the
+  Windows Cloud Filter API reparse-point mechanism other providers use.**
+  Sampling a real 52,000+ file "iCloud Photos" folder showed that iCloud for
+  Windows does **not** use the Windows Cloud Filter API's reparse-point
+  placeholders (`cldapi.dll`) at all -- every file came back
+  `CF_PLACEHOLDER_STATE_NO_STATES`. Instead it marks files with the
+  lighter-weight cloud-file *attribute* bits: a file with
   `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` (or `RECALL_ON_OPEN`) isn't fully
-  present on disk yet and would have to be fetched from the cloud to be
-  opened, so it's shown as **Refreshing** (still downloading / queued) even
-  though the same file might separately show as "in sync" at the metadata
-  level -- local content completeness wins over that metadata bit. A file
-  with neither of those attributes nor any placeholder markers is treated as
-  **Synced**, since cloud providers mark a file that still needs to be
-  uploaded, or isn't fully downloaded, immediately -- the absence of any such
-  marker is the normal state for a file that's already finished syncing. The
-  Cloud Filter placeholder path is still checked first and used when present,
-  so a provider that *does* use reparse-point placeholders (OneDrive, for
-  example) is handled by that path instead. Neither mechanism reports a live
-  "% complete" for an in-flight transfer.
+  present on disk yet and would have to be fetched from iCloud to be opened,
+  so it's shown as **Refreshing** (still downloading / queued); a file with
+  neither attribute is treated as **Synced**. This app deliberately does
+  *not* also check the Cloud Filter placeholder state that OneDrive (and
+  some other providers) use -- so a file that happens to also sit somewhere
+  OneDrive manages is judged purely on iCloud's own marker, never on what
+  OneDrive thinks of it. Neither mechanism reports a live "% complete" for
+  an in-flight transfer.
 - Comparison is by **path and structure only** -- it does not compare file
   contents, size, or modified date to detect changes to a file that exists
   on both sides. That keeps scans fast on very large libraries, but it also
