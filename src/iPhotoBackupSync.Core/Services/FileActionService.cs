@@ -15,6 +15,13 @@ public sealed class FileActionService
     /// Copies every selected file (recursing into selected directories) to the
     /// destination root, preserving the path relative to the origin root. Never
     /// deletes or modifies anything in the origin.
+    ///
+    /// Since <see cref="FolderComparer"/> now matches files by content
+    /// (<see cref="FileFingerprint"/>) rather than by name, a file that's "missing" can
+    /// still share its name with something already sitting at the destination under a
+    /// name iCloud has since reused for different content. Never blindly overwrite that:
+    /// if the destination name is taken by a file with a different fingerprint, this picks
+    /// an alternate name instead, the same way Windows Explorer would.
     /// </summary>
     public async Task CopyToDestinationAsync(
         IEnumerable<FileNode> selectedNodes,
@@ -41,16 +48,55 @@ public sealed class FileActionService
                 Directory.CreateDirectory(destDir);
             }
 
+            var sourceInfo = new FileInfo(file.FullPath);
+            var sourceFingerprint = new FileFingerprint(SafeLength(sourceInfo), SafeLastWriteUtc(sourceInfo));
+            destPath = ResolveSafeDestinationPath(destPath, sourceFingerprint);
+
             await using (var source = File.OpenRead(file.FullPath))
             await using (var dest = File.Create(destPath))
             {
                 await source.CopyToAsync(dest, cancellationToken);
             }
-            File.SetLastWriteTimeUtc(destPath, File.GetLastWriteTimeUtc(file.FullPath));
+            File.SetLastWriteTimeUtc(destPath, sourceInfo.LastWriteTimeUtc);
 
             copied++;
-            progress?.Report((copied, files.Count, file.RelativePath));
+            progress?.Report((copied, files.Count, Path.GetRelativePath(destinationRoot, destPath)));
         }
+    }
+
+    /// <summary>Returns <paramref name="destPath"/> unchanged if nothing is there yet, or if
+    /// what's there already has the same content fingerprint (genuinely the same file, safe
+    /// to overwrite in place). Otherwise a different file already occupies that name, so
+    /// this returns the first "name (1)", "name (2)", ... variant that's free.</summary>
+    private static string ResolveSafeDestinationPath(string destPath, FileFingerprint sourceFingerprint)
+    {
+        if (!File.Exists(destPath)) return destPath;
+
+        var existing = new FileInfo(destPath);
+        var existingFingerprint = new FileFingerprint(SafeLength(existing), SafeLastWriteUtc(existing));
+        if (existingFingerprint == sourceFingerprint) return destPath;
+
+        var dir = Path.GetDirectoryName(destPath) ?? string.Empty;
+        var baseName = Path.GetFileNameWithoutExtension(destPath);
+        var ext = Path.GetExtension(destPath);
+        var counter = 1;
+        string candidate;
+        do
+        {
+            candidate = Path.Combine(dir, $"{baseName} ({counter}){ext}");
+            counter++;
+        } while (File.Exists(candidate));
+        return candidate;
+    }
+
+    private static long SafeLength(FileInfo fi)
+    {
+        try { return fi.Length; } catch { return 0; }
+    }
+
+    private static DateTime? SafeLastWriteUtc(FileInfo fi)
+    {
+        try { return fi.LastWriteTimeUtc; } catch { return null; }
     }
 
     public void ExportToCsv(IEnumerable<FileNode> nodes, string csvPath)

@@ -1,3 +1,4 @@
+using iPhotoBackupSync.Core.Models;
 using iPhotoBackupSync.Core.Services;
 using Xunit;
 
@@ -18,12 +19,19 @@ public sealed class BackupManifestServiceTests : IDisposable
         try { Directory.Delete(_root, recursive: true); } catch { /* best effort cleanup */ }
     }
 
+    private static void WriteFile(string path, string content, DateTime modifiedUtc)
+    {
+        File.WriteAllText(path, content);
+        File.SetLastWriteTimeUtc(path, modifiedUtc);
+    }
+
     [Fact]
     public async Task GenerateManifest_RecordsTopLevelFilesOnly()
     {
-        File.WriteAllText(Path.Combine(_root, "a.jpg"), "x");
+        var modified = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        WriteFile(Path.Combine(_root, "a.jpg"), "x", modified);
         Directory.CreateDirectory(Path.Combine(_root, "Sub"));
-        File.WriteAllText(Path.Combine(_root, "Sub", "b.jpg"), "yy");
+        WriteFile(Path.Combine(_root, "Sub", "b.jpg"), "yy", modified);
 
         var service = new BackupManifestService();
         var result = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
@@ -37,9 +45,9 @@ public sealed class BackupManifestServiceTests : IDisposable
         var manifestPath = Path.Combine(_root, BackupManifestService.ManifestFileName);
         Assert.True(File.Exists(manifestPath));
 
-        var recorded = service.ReadManifestPaths(_root);
-        Assert.Contains("a.jpg", recorded);
-        Assert.DoesNotContain(Path.Combine("Sub", "b.jpg"), recorded);
+        var recorded = service.ReadManifestFingerprints(_root);
+        Assert.Contains(new FileFingerprint(1, modified), recorded); // "x"
+        Assert.DoesNotContain(new FileFingerprint(2, modified), recorded); // "yy", in Sub
     }
 
     [Fact]
@@ -49,23 +57,24 @@ public sealed class BackupManifestServiceTests : IDisposable
         await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
         await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
 
-        var recorded = service.ReadManifestPaths(_root);
-        Assert.DoesNotContain(BackupManifestService.ManifestFileName, recorded);
+        Assert.Empty(service.ReadManifestFingerprints(_root));
     }
 
     [Fact]
     public async Task GenerateManifest_RerunAfterFileArchivedElsewhere_KeepsItsEntry()
     {
         var service = new BackupManifestService();
+        var modifiedA = new DateTime(2020, 5, 1, 0, 0, 0, DateTimeKind.Utc);
         var pathA = Path.Combine(_root, "a.jpg");
-        File.WriteAllText(pathA, "x");
+        WriteFile(pathA, "x", modifiedA);
 
         var first = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
         Assert.Equal(1, first.TotalEntries);
 
         // Simulate the file being moved off to an archive drive, plus a new file arriving.
         File.Delete(pathA);
-        File.WriteAllText(Path.Combine(_root, "b.jpg"), "yy");
+        var modifiedB = new DateTime(2021, 6, 1, 0, 0, 0, DateTimeKind.Utc);
+        WriteFile(Path.Combine(_root, "b.jpg"), "yy", modifiedB);
 
         var second = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
 
@@ -73,28 +82,30 @@ public sealed class BackupManifestServiceTests : IDisposable
         Assert.Equal(1, second.NewEntries);
         Assert.Equal(2, second.TotalEntries);
 
-        var recorded = service.ReadManifestPaths(_root);
-        Assert.Contains("a.jpg", recorded); // never removed, even though it's gone from disk
-        Assert.Contains("b.jpg", recorded);
+        var recorded = service.ReadManifestFingerprints(_root);
+        Assert.Contains(new FileFingerprint(1, modifiedA), recorded); // never removed, even gone from disk
+        Assert.Contains(new FileFingerprint(2, modifiedB), recorded);
     }
 
     [Fact]
-    public void ReadManifestPaths_NoManifestFile_ReturnsEmpty()
+    public void ReadManifestFingerprints_NoManifestFile_ReturnsEmpty()
     {
         var service = new BackupManifestService();
-        Assert.Empty(service.ReadManifestPaths(_root));
+        Assert.Empty(service.ReadManifestFingerprints(_root));
     }
 
     [Fact]
     public async Task GenerateManifest_NewEntries_AppendedAfterAddedMarker_ExistingEntryKeepsPosition()
     {
         var service = new BackupManifestService();
-        File.WriteAllText(Path.Combine(_root, "z.jpg"), "first");
+        var modifiedZ = new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        WriteFile(Path.Combine(_root, "z.jpg"), "first", modifiedZ);
         await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
 
         // Alphabetically before z.jpg -- a plain resort would put this first, but the new
         // format never resorts existing entries; new ones only ever get appended at the end.
-        File.WriteAllText(Path.Combine(_root, "a.jpg"), "second");
+        var modifiedA = new DateTime(2019, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        WriteFile(Path.Combine(_root, "a.jpg"), "second-content", modifiedA);
         var result = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
 
         Assert.Equal(1, result.PreviousEntries);
@@ -111,5 +122,30 @@ public sealed class BackupManifestServiceTests : IDisposable
         Assert.True(zIndex >= 0 && addedMarkerIndex >= 0 && aIndex >= 0);
         Assert.True(zIndex < addedMarkerIndex, "existing entry should stay before the new batch's marker");
         Assert.True(addedMarkerIndex < aIndex, "new entry should come after its batch's marker");
+    }
+
+    [Fact]
+    public async Task GenerateManifest_FileRenamedWithSameContent_UpdatesRecordedNameInPlace()
+    {
+        // Simulates iCloud renaming a file while its bytes/date stay the same -- the
+        // manifest should follow the content (fingerprint), not the name, and treat this
+        // as the same entry rather than a new one.
+        var service = new BackupManifestService();
+        var modified = new DateTime(2022, 3, 3, 0, 0, 0, DateTimeKind.Utc);
+        var oldPath = Path.Combine(_root, "IMG_1596.HEIC");
+        WriteFile(oldPath, "same-bytes", modified);
+        var first = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
+        Assert.Equal(1, first.NewEntries);
+
+        File.Move(oldPath, Path.Combine(_root, "IMG_1596(1).HEIC"));
+        var second = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
+
+        Assert.Equal(1, second.PreviousEntries);
+        Assert.Equal(0, second.NewEntries); // same fingerprint -- refreshed in place, not a new entry
+        Assert.Equal(1, second.TotalEntries);
+
+        var lines = File.ReadAllLines(Path.Combine(_root, BackupManifestService.ManifestFileName));
+        Assert.Contains(lines, l => l.StartsWith("IMG_1596(1).HEIC\t", StringComparison.Ordinal));
+        Assert.DoesNotContain(lines, l => l.StartsWith("IMG_1596.HEIC\t", StringComparison.Ordinal));
     }
 }

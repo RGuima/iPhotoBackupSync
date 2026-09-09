@@ -4,17 +4,22 @@ namespace iPhotoBackupSync.Core.Services;
 
 /// <summary>
 /// Compares the files directly inside an origin folder against the files directly inside
-/// a destination folder (name only -- file contents are never read, which keeps this fast
-/// even for very large photo libraries) and produces the list of files that exist in the
-/// origin but not the destination.
+/// a destination folder and produces the list of files that exist in the origin but not
+/// the destination. Matching is by <see cref="FileFingerprint"/> (size + last-modified
+/// time), not by name: iCloud renames files as part of its own sync/conflict resolution
+/// over time (observed in practice: a plain name like "IMG_1596.HEIC" got reassigned to a
+/// different, newer photo while the original became "IMG_1596(1).HEIC"), so matching by
+/// name alone can both hide a genuinely-missing file behind a stale same-named entry and
+/// falsely re-flag an already-backed-up file that iCloud happened to rename. File contents
+/// themselves are still never read/hashed, which keeps this fast on very large libraries.
 ///
 /// Deliberately top-level only: subfolders on either side are never descended into. This
 /// app always copies files straight into the destination root, and the origin (an iCloud
 /// Photos folder) is flat too -- any subfolder that shows up at the destination belongs to
 /// something else entirely (in practice, a separate tool that sorts this same folder's
 /// contents into dated Photos/Videos/Documents subfolders after the fact). Comparing
-/// against those would be both pointless (renamed copies never match an origin filename
-/// anyway) and wasteful (that tool's output can run into the tens of thousands of files).
+/// against those would be wasteful (that tool's output can run into the tens of thousands
+/// of files) for no benefit.
 /// </summary>
 public sealed class FolderComparer
 {
@@ -41,24 +46,22 @@ public sealed class FolderComparer
             progress?.Report(new CompareProgress(phase, dirsScanned, filesScanned, missingFound, currentPath));
         }
 
-        // Phase 1: index the destination root's top-level file names.
-        var destinationIndex = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Phase 1: index the destination root's top-level files by content fingerprint.
+        var destinationIndex = new HashSet<FileFingerprint>();
         if (Directory.Exists(destinationRoot))
         {
-            foreach (var name in EnumerateTopLevelFileNames(destinationRoot))
+            foreach (var fi in EnumerateTopLevelFiles(destinationRoot))
             {
-                destinationIndex.Add(name);
+                destinationIndex.Add(new FileFingerprint(SafeLength(fi), SafeLastWriteUtc(fi)));
             }
         }
         ReportProgress(ComparePhase.IndexingDestination, 1, destinationRoot);
 
         // Files recorded in a backup manifest at the destination root count as already
         // backed up even if the bytes aren't actually there -- e.g. archived elsewhere.
-        // The manifest itself is top-level-only now too, so every entry here is a bare
-        // file name already comparable against an origin file name directly.
-        foreach (var manifestPath in _manifestService.ReadManifestPaths(destinationRoot))
+        foreach (var fingerprint in _manifestService.ReadManifestFingerprints(destinationRoot))
         {
-            destinationIndex.Add(manifestPath);
+            destinationIndex.Add(fingerprint);
         }
 
         // Phase 2: walk the origin root's top-level files only.
@@ -79,7 +82,9 @@ public sealed class FolderComparer
                 cancellationToken.ThrowIfCancellationRequested();
                 filesScanned++;
 
-                if (!destinationIndex.Contains(fi.Name))
+                var size = SafeLength(fi);
+                var modified = SafeLastWriteUtc(fi);
+                if (!destinationIndex.Contains(new FileFingerprint(size, modified)))
                 {
                     missingFound++;
                     rootNode.Children.Add(new FileNode
@@ -89,8 +94,8 @@ public sealed class FolderComparer
                         RelativePath = fi.Name,
                         IsDirectory = false,
                         IsMissing = true,
-                        SizeBytes = SafeLength(fi),
-                        LastModifiedUtc = SafeLastWriteUtc(fi)
+                        SizeBytes = size,
+                        LastModifiedUtc = modified
                     });
                 }
 
@@ -117,9 +122,6 @@ public sealed class FolderComparer
         ReportProgress(ComparePhase.Done, 1, null);
         return rootNode;
     }
-
-    private static IEnumerable<string> EnumerateTopLevelFileNames(string dir) =>
-        EnumerateTopLevelFiles(dir).Select(fi => fi.Name);
 
     private static List<FileInfo> EnumerateTopLevelFiles(string dir)
     {

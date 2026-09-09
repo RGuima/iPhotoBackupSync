@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using iPhotoBackupSync.Core.Models;
 
 namespace iPhotoBackupSync.Core.Services;
 
@@ -8,9 +9,10 @@ namespace iPhotoBackupSync.Core.Services;
 /// destination folder, recording files that should be treated as already backed up
 /// even though the actual bytes aren't (or are no longer) present in that folder --
 /// e.g. because they were archived to offline media, a different drive, or cold
-/// storage after the fact. A manifest entry is matched by relative path, the same
-/// signal <see cref="FolderComparer"/> already uses to decide whether a file exists
-/// in the destination (path/structure only, not content).
+/// storage after the fact. A manifest entry is matched by <see cref="FileFingerprint"/>
+/// (size + last-modified time), the same signal <see cref="FolderComparer"/> uses to
+/// decide whether a file exists in the destination -- not by name, since iCloud can
+/// reassign a name to different content over time (see <see cref="FileFingerprint"/>).
 /// </summary>
 /// <summary>
 /// Result of a manifest generation pass: <paramref name="TotalEntries"/> is the full
@@ -26,38 +28,18 @@ public sealed class BackupManifestService
 
     /// <summary>
     /// Reads the manifest file at <paramref name="destinationRoot"/>, if one exists, and
-    /// returns every relative path it records plus every ancestor folder of each path --
-    /// so a folder that only exists because manifest entries live under it isn't itself
-    /// reported as missing. Returns an empty set if there is no manifest.
+    /// returns the content fingerprint (size + last-modified time) of every file it
+    /// records. Returns an empty set if there is no manifest.
     /// </summary>
-    public IReadOnlySet<string> ReadManifestPaths(string destinationRoot)
+    public IReadOnlySet<FileFingerprint> ReadManifestFingerprints(string destinationRoot)
     {
-        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var manifestPath = Path.Combine(destinationRoot, ManifestFileName);
-        if (!File.Exists(manifestPath)) return result;
-
-        foreach (var line in File.ReadLines(manifestPath))
+        var result = new HashSet<FileFingerprint>();
+        foreach (var line in ParseBody(manifestPath))
         {
-            if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith('#')) continue;
-
-            var relativePath = line.Split('\t')[0].Trim();
-            if (relativePath.Length == 0) continue;
-
-            AddWithAncestors(result, relativePath);
+            if (line.Entry is { } entry) result.Add(entry.Fingerprint);
         }
-
         return result;
-    }
-
-    private static void AddWithAncestors(HashSet<string> set, string relativePath)
-    {
-        set.Add(relativePath);
-        var dir = Path.GetDirectoryName(relativePath);
-        while (!string.IsNullOrEmpty(dir))
-        {
-            set.Add(dir);
-            dir = Path.GetDirectoryName(dir);
-        }
     }
 
     /// <summary>
@@ -69,11 +51,13 @@ public sealed class BackupManifestService
     /// elsewhere after being recorded), since that entry may be the only remaining record
     /// that the file was ever backed up.
     ///
-    /// Existing entries keep their original position in the file even when refreshed (only
-    /// their size/date change); they are never resorted. Files new to this run are appended
-    /// at the very end instead, preceded by a "# Added &lt;timestamp&gt;" comment marking
-    /// that batch -- so the file reads as a rough history of when things were added, and a
-    /// diff between two versions only ever shows a new block tacked on the end.
+    /// Existing entries are matched by <see cref="FileFingerprint"/> (size + last-modified
+    /// time), not by name, and keep their original position in the file even when refreshed
+    /// -- only the recorded name is updated, in case iCloud renamed the file since the last
+    /// scan. Entries are never resorted; files new to this run are appended at the very end
+    /// instead, preceded by a "# Added &lt;timestamp&gt;" comment marking that batch -- so
+    /// the file reads as a rough history of when things were added, and a diff between two
+    /// versions only ever shows a new block tacked on the end.
     ///
     /// Deliberately not recursive: this app always copies files straight into the
     /// destination root (it never mirrors origin subfolders), so any subfolder here belongs
@@ -104,13 +88,17 @@ public sealed class BackupManifestService
 
         var body = ParseBody(manifestPath);
 
-        // Map each existing entry's relative path to its position in `body`, so a file
-        // that's still present gets its size/date refreshed in place -- new entries are the
-        // only ones that ever get appended.
-        var existingIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        // Map each existing entry's content fingerprint (size + last-modified time, not
+        // name -- see FileFingerprint) to its position in `body`, so a file that's still
+        // present gets its recorded name refreshed in place if iCloud has since renamed it;
+        // new entries are the only ones that ever get appended. Two entries can't collide on
+        // fingerprint here since ParseBody never returns duplicate fingerprints for distinct
+        // files unless the destination genuinely has byte-identical duplicates, in which
+        // case treating them as one backed-up item is correct.
+        var existingIndex = new Dictionary<FileFingerprint, int>();
         for (var i = 0; i < body.Count; i++)
         {
-            if (body[i].Entry is { } existing) existingIndex[existing.RelativePath] = i;
+            if (body[i].Entry is { } existing) existingIndex[existing.Fingerprint] = i;
         }
         var previousCount = existingIndex.Count;
 
@@ -119,9 +107,9 @@ public sealed class BackupManifestService
         var newEntries = new List<ManifestEntry>();
         foreach (var entry in scannedEntries)
         {
-            if (existingIndex.TryGetValue(entry.RelativePath, out var index))
+            if (existingIndex.TryGetValue(entry.Fingerprint, out var index))
             {
-                body[index] = BodyLine.Data(entry);
+                body[index] = BodyLine.Data(entry); // same content; refreshes the recorded name too
             }
             else
             {
@@ -266,7 +254,10 @@ public sealed class BackupManifestService
              or "# RelativePath\tSizeBytes\tLastModifiedUtc"
              || line.StartsWith("# Last generated", StringComparison.Ordinal);
 
-    private readonly record struct ManifestEntry(string RelativePath, long SizeBytes, DateTime? LastModifiedUtc);
+    private readonly record struct ManifestEntry(string RelativePath, long SizeBytes, DateTime? LastModifiedUtc)
+    {
+        public FileFingerprint Fingerprint => new(SizeBytes, LastModifiedUtc);
+    }
 
     /// <summary>One line of the manifest body: either a preserved comment or a data entry,
     /// never both. Use <see cref="Comment"/>/<see cref="Data"/> to construct.</summary>
