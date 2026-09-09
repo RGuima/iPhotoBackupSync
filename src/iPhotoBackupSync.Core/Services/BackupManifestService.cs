@@ -151,7 +151,33 @@ public sealed class BackupManifestService
                 "up). Nothing was written -- try again once the destination is reliably reachable.");
         }
 
+        // Windows' CreateFile refuses to overwrite an existing file that already has the
+        // Hidden (or System) attribute unless the write explicitly re-specifies it, and
+        // File.WriteAllTextAsync doesn't -- so without clearing it first, every write after
+        // the first one here would throw UnauthorizedAccessException once the file is hidden.
+        if (File.Exists(manifestPath))
+        {
+            try { File.SetAttributes(manifestPath, FileAttributes.Normal); } catch { /* best-effort */ }
+        }
+
         await File.WriteAllTextAsync(manifestPath, sb.ToString(), Encoding.UTF8, cancellationToken);
+
+        // Mark the manifest hidden so NAS/media-import tools that auto-sort a folder's
+        // contents by file type (which, on at least one real NAS, physically relocated this
+        // exact file into a dated "Documents" archive because it isn't a photo/video --
+        // wiping out the destination's manifest history the next time this ran) are far less
+        // likely to enumerate it in the first place. WriteAllTextAsync above always creates a
+        // fresh file, so this has to be reapplied on every write, not just the first one.
+        try
+        {
+            File.SetAttributes(manifestPath, File.GetAttributes(manifestPath) | FileAttributes.Hidden);
+        }
+        catch
+        {
+            // Best-effort: some filesystems/SMB configurations don't support setting
+            // attributes. The manifest still works fine without it, just more discoverable.
+        }
+
         return new ManifestGenerationResult(sorted.Count, newCount, previousCount);
     }
 
