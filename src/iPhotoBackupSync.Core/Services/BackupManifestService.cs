@@ -69,6 +69,12 @@ public sealed class BackupManifestService
     /// elsewhere after being recorded), since that entry may be the only remaining record
     /// that the file was ever backed up.
     ///
+    /// Existing entries keep their original position in the file even when refreshed (only
+    /// their size/date change); they are never resorted. Files new to this run are appended
+    /// at the very end instead, preceded by a "# Added &lt;timestamp&gt;" comment marking
+    /// that batch -- so the file reads as a rough history of when things were added, and a
+    /// diff between two versions only ever shows a new block tacked on the end.
+    ///
     /// Deliberately not recursive: this app always copies files straight into the
     /// destination root (it never mirrors origin subfolders), so any subfolder here belongs
     /// to something else entirely -- in practice, a separate file-organizer tool that sorts
@@ -96,25 +102,41 @@ public sealed class BackupManifestService
                 $"Destination folder is not reachable, refusing to touch its manifest: {folderRoot}");
         }
 
-        var merged = new Dictionary<string, ManifestEntry>(StringComparer.OrdinalIgnoreCase);
-        foreach (var existing in ReadRawEntries(manifestPath))
+        var body = ParseBody(manifestPath);
+
+        // Map each existing entry's relative path to its position in `body`, so a file
+        // that's still present gets its size/date refreshed in place -- new entries are the
+        // only ones that ever get appended.
+        var existingIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < body.Count; i++)
         {
-            merged[existing.RelativePath] = existing;
+            if (body[i].Entry is { } existing) existingIndex[existing.RelativePath] = i;
         }
-        var previousCount = merged.Count;
+        var previousCount = existingIndex.Count;
 
         var scannedEntries = CollectTopLevelEntries(folderRoot, manifestPath, progress, cancellationToken);
 
-        // Add newly found files and refresh size/date for ones already recorded that are
-        // still present; entries for files not seen in this scan are left untouched.
-        var newCount = 0;
+        var newEntries = new List<ManifestEntry>();
         foreach (var entry in scannedEntries)
         {
-            if (!merged.ContainsKey(entry.RelativePath)) newCount++;
-            merged[entry.RelativePath] = entry;
+            if (existingIndex.TryGetValue(entry.RelativePath, out var index))
+            {
+                body[index] = BodyLine.Data(entry);
+            }
+            else
+            {
+                newEntries.Add(entry);
+            }
         }
 
-        var sorted = merged.Values.OrderBy(e => e.RelativePath, StringComparer.OrdinalIgnoreCase).ToList();
+        if (newEntries.Count > 0)
+        {
+            newEntries.Sort((a, b) => string.Compare(a.RelativePath, b.RelativePath, StringComparison.OrdinalIgnoreCase));
+            body.Add(BodyLine.Comment($"# Added {DateTime.UtcNow:O}"));
+            body.AddRange(newEntries.Select(BodyLine.Data));
+        }
+
+        var totalCount = body.Count(l => l.Entry is not null);
 
         var sb = new StringBuilder();
         sb.AppendLine("# iPhotoBackupSync manifest -- files considered already backed up in this folder,");
@@ -122,14 +144,23 @@ public sealed class BackupManifestService
         sb.AppendLine("# Delete a line (or this whole file) to make iPhotoBackupSync treat that file as");
         sb.AppendLine("# missing again the next time you Compare. Regenerating this file only ever adds");
         sb.AppendLine("# or refreshes entries -- it never removes one for a file it doesn't currently see.");
+        sb.AppendLine("# New entries are appended at the end after a \"# Added <timestamp>\" marker rather");
+        sb.AppendLine("# than the whole file being resorted, so existing entries keep their position.");
         sb.AppendLine(CultureInfo.InvariantCulture, $"# Last generated {DateTime.UtcNow:O}");
         sb.AppendLine("# RelativePath\tSizeBytes\tLastModifiedUtc");
-        foreach (var entry in sorted)
+        foreach (var line in body)
         {
-            sb.Append(entry.RelativePath).Append('\t')
-              .Append(entry.SizeBytes.ToString(CultureInfo.InvariantCulture)).Append('\t')
-              .Append(entry.LastModifiedUtc?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty)
-              .Append('\n');
+            if (line.CommentText is { } comment)
+            {
+                sb.Append(comment).Append('\n');
+            }
+            else if (line.Entry is { } entry)
+            {
+                sb.Append(entry.RelativePath).Append('\t')
+                  .Append(entry.SizeBytes.ToString(CultureInfo.InvariantCulture)).Append('\t')
+                  .Append(entry.LastModifiedUtc?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty)
+                  .Append('\n');
+            }
         }
 
         // Safety net: if a manifest is already on disk right now and it has more entries
@@ -140,12 +171,12 @@ public sealed class BackupManifestService
         // making File.Exists/File.ReadLines see nothing at the moment they were checked.
         // Silently overwriting in that case would look identical to "this folder legitimately
         // lost half its files" from the outside; refuse instead, and leave the old file alone.
-        var onDiskCount = ReadRawEntries(manifestPath).Count;
-        if (onDiskCount > sorted.Count)
+        var onDiskCount = ParseBody(manifestPath).Count(l => l.Entry is not null);
+        if (onDiskCount > totalCount)
         {
             throw new IOException(
                 $"Refusing to overwrite manifest at \"{manifestPath}\": it currently has {onDiskCount:N0} " +
-                $"entries on disk, but this run only produced {sorted.Count:N0} after merging. The destination " +
+                $"entries on disk, but this run only produced {totalCount:N0} after merging. The destination " +
                 "was likely temporarily unreachable during part of this run (e.g. a NAS share still waking " +
                 "up). Nothing was written -- try again once the destination is reliably reachable.");
         }
@@ -177,17 +208,30 @@ public sealed class BackupManifestService
             // attributes. The manifest still works fine without it, just more discoverable.
         }
 
-        return new ManifestGenerationResult(sorted.Count, newCount, previousCount);
+        return new ManifestGenerationResult(totalCount, newEntries.Count, previousCount);
     }
 
-    private static List<ManifestEntry> ReadRawEntries(string manifestPath)
+    /// <summary>
+    /// Reads every line of the manifest, in file order, as either a preserved comment (e.g.
+    /// a previous run's "# Added &lt;timestamp&gt;" batch marker) or a parsed data entry --
+    /// skipping only the fixed instructional header this method itself regenerates fresh on
+    /// every write. Returns an empty list if there is no manifest yet.
+    /// </summary>
+    private static List<BodyLine> ParseBody(string manifestPath)
     {
-        var result = new List<ManifestEntry>();
-        if (!File.Exists(manifestPath)) return result;
+        var body = new List<BodyLine>();
+        if (!File.Exists(manifestPath)) return body;
 
         foreach (var line in File.ReadLines(manifestPath))
         {
-            if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith('#')) continue;
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            var trimmed = line.TrimStart();
+            if (trimmed.StartsWith('#'))
+            {
+                if (!IsGeneratedHeaderLine(trimmed)) body.Add(BodyLine.Comment(trimmed));
+                continue;
+            }
 
             var parts = line.Split('\t');
             var relativePath = parts[0].Trim();
@@ -202,13 +246,35 @@ public sealed class BackupManifestService
                 modified = parsed;
             }
 
-            result.Add(new ManifestEntry(relativePath, size, modified));
+            body.Add(BodyLine.Data(new ManifestEntry(relativePath, size, modified)));
         }
 
-        return result;
+        return body;
     }
 
+    /// <summary>True for one of the fixed instructional/column-header lines this method
+    /// writes fresh at the top of the file on every run -- these are never preserved
+    /// verbatim, unlike a batch marker such as "# Added &lt;timestamp&gt;".</summary>
+    private static bool IsGeneratedHeaderLine(string line) =>
+        line is "# iPhotoBackupSync manifest -- files considered already backed up in this folder,"
+             or "# even though the file itself may not be present here (e.g. archived elsewhere)."
+             or "# Delete a line (or this whole file) to make iPhotoBackupSync treat that file as"
+             or "# missing again the next time you Compare. Regenerating this file only ever adds"
+             or "# or refreshes entries -- it never removes one for a file it doesn't currently see."
+             or "# New entries are appended at the end after a \"# Added <timestamp>\" marker rather"
+             or "# than the whole file being resorted, so existing entries keep their position."
+             or "# RelativePath\tSizeBytes\tLastModifiedUtc"
+             || line.StartsWith("# Last generated", StringComparison.Ordinal);
+
     private readonly record struct ManifestEntry(string RelativePath, long SizeBytes, DateTime? LastModifiedUtc);
+
+    /// <summary>One line of the manifest body: either a preserved comment or a data entry,
+    /// never both. Use <see cref="Comment"/>/<see cref="Data"/> to construct.</summary>
+    private readonly record struct BodyLine(string? CommentText, ManifestEntry? Entry)
+    {
+        public static BodyLine Comment(string text) => new(text, null);
+        public static BodyLine Data(ManifestEntry entry) => new(null, entry);
+    }
 
     private static List<ManifestEntry> CollectTopLevelEntries(
         string root,

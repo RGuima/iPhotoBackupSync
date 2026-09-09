@@ -84,4 +84,32 @@ public sealed class BackupManifestServiceTests : IDisposable
         var service = new BackupManifestService();
         Assert.Empty(service.ReadManifestPaths(_root));
     }
+
+    [Fact]
+    public async Task GenerateManifest_NewEntries_AppendedAfterAddedMarker_ExistingEntryKeepsPosition()
+    {
+        var service = new BackupManifestService();
+        File.WriteAllText(Path.Combine(_root, "z.jpg"), "first");
+        await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
+
+        // Alphabetically before z.jpg -- a plain resort would put this first, but the new
+        // format never resorts existing entries; new ones only ever get appended at the end.
+        File.WriteAllText(Path.Combine(_root, "a.jpg"), "second");
+        var result = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
+
+        Assert.Equal(1, result.PreviousEntries);
+        Assert.Equal(1, result.NewEntries);
+        Assert.Equal(2, result.TotalEntries);
+
+        var lines = File.ReadAllLines(Path.Combine(_root, BackupManifestService.ManifestFileName));
+        var zIndex = Array.FindIndex(lines, l => l.StartsWith("z.jpg\t", StringComparison.Ordinal));
+        // The first generation call above also appended z.jpg after its own "# Added"
+        // marker, so there are two markers in the file now -- this run's is the last one.
+        var addedMarkerIndex = Array.FindLastIndex(lines, l => l.StartsWith("# Added ", StringComparison.Ordinal));
+        var aIndex = Array.FindIndex(lines, l => l.StartsWith("a.jpg\t", StringComparison.Ordinal));
+
+        Assert.True(zIndex >= 0 && addedMarkerIndex >= 0 && aIndex >= 0);
+        Assert.True(zIndex < addedMarkerIndex, "existing entry should stay before the new batch's marker");
+        Assert.True(addedMarkerIndex < aIndex, "new entry should come after its batch's marker");
+    }
 }

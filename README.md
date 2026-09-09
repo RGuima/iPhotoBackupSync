@@ -58,7 +58,11 @@ stays responsive across tens of thousands of files.
   last-modified date) -- handy for stamping an existing archive as "already
   backed up" in one click. Regenerating only ever adds or refreshes entries;
   it never deletes one for a file the scan doesn't currently see, since that
-  file may have since been moved to a different archive. It's also marked
+  file may have since been moved to a different archive. Existing entries
+  keep their original position in the file even when refreshed -- they're
+  never resorted -- and files new to a run are appended at the very end,
+  preceded by a `# Added <timestamp>` marker for that batch, so the file
+  reads as a rough history of when things were added. It's also marked
   Hidden on every write, and generation refuses to ever overwrite it with
   fewer entries than it already has -- both guard against other tools that
   scan a folder's visible contents (see Notes & limitations).
