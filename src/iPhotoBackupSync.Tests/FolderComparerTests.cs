@@ -54,23 +54,22 @@ public sealed class FolderComparerTests : IDisposable
     public async Task FileOnlyInOrigin_IsReportedMissing()
     {
         WriteOrigin("root1.jpg");
-        WriteOrigin("SubA/a1.jpg");
-        WriteOrigin("SubA/a2.jpg");
-        WriteDestination("SubA/a1.jpg");
+        WriteOrigin("root2.jpg");
+        WriteDestination("root2.jpg");
 
         var comparer = new FolderComparer();
         var result = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
 
         var missing = FlattenFiles(result).Select(f => f.RelativePath).OrderBy(x => x).ToList();
-        Assert.Equal(new[] { "root1.jpg", "SubA\\a2.jpg" }, missing);
-        Assert.Equal(2, result.MissingFileCount);
+        Assert.Equal(new[] { "root1.jpg" }, missing);
+        Assert.Equal(1, result.MissingFileCount);
     }
 
     [Fact]
-    public async Task IdenticalTrees_ProduceNoResults()
+    public async Task IdenticalTopLevelFiles_ProduceNoResults()
     {
-        WriteOrigin("SubA/a1.jpg");
-        WriteDestination("SubA/a1.jpg");
+        WriteOrigin("a1.jpg");
+        WriteDestination("a1.jpg");
 
         var comparer = new FolderComparer();
         var result = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
@@ -80,16 +79,21 @@ public sealed class FolderComparerTests : IDisposable
     }
 
     [Fact]
-    public async Task EntireMissingSubfolder_ListsAllNestedFiles()
+    public async Task FilesInSubfolders_AreIgnoredOnBothSides()
     {
+        // Subfolders are never descended into on either side -- a separate tool that
+        // reorganizes this same destination folder's contents into dated subfolders
+        // shouldn't have its output compared against (or matched to) origin files.
         WriteOrigin("SubB/nested/deep.jpg");
         WriteOrigin("SubB/b1.jpg");
+        WriteOrigin("top.jpg");
+        WriteDestination("top.jpg");
 
         var comparer = new FolderComparer();
         var result = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
 
-        var missing = FlattenFiles(result).Select(f => f.RelativePath).OrderBy(x => x).ToList();
-        Assert.Equal(new[] { "SubB\\b1.jpg", "SubB\\nested\\deep.jpg" }, missing);
+        Assert.Empty(FlattenFiles(result));
+        Assert.Equal(0, result.MissingFileCount);
     }
 
     [Fact]
@@ -107,16 +111,16 @@ public sealed class FolderComparerTests : IDisposable
     [Fact]
     public async Task FileRecordedInManifest_IsNotReportedMissing()
     {
-        WriteOrigin("SubA/archived.jpg");
-        WriteOrigin("SubA/still-missing.jpg");
+        WriteOrigin("archived.jpg");
+        WriteOrigin("still-missing.jpg");
         File.WriteAllText(
             Path.Combine(_destination, BackupManifestService.ManifestFileName),
-            "# comment line, ignored\nSubA\\archived.jpg\t123\t2024-01-01T00:00:00Z\n");
+            "# comment line, ignored\narchived.jpg\t123\t2024-01-01T00:00:00Z\n");
 
         var comparer = new FolderComparer();
         var result = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
 
         var missing = FlattenFiles(result).Select(f => f.RelativePath).OrderBy(x => x).ToList();
-        Assert.Equal(new[] { "SubA\\still-missing.jpg" }, missing);
+        Assert.Equal(new[] { "still-missing.jpg" }, missing);
     }
 }

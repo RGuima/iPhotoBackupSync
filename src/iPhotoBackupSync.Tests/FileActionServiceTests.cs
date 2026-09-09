@@ -33,9 +33,11 @@ public sealed class FileActionServiceTests : IDisposable
     [Fact]
     public async Task CopyToDestination_ThenRecompare_ReportsNothingMissing()
     {
+        // Compare is top-level only, so exercise it with top-level origin files -- the same
+        // shape the real iCloud Photos origin folder actually has.
         WriteOrigin("root1.jpg", "a");
-        WriteOrigin("SubA/a1.jpg", "b");
-        WriteOrigin("SubA/a2.jpg", "c");
+        WriteOrigin("root2.jpg", "b");
+        WriteOrigin("root3.jpg", "c");
 
         var comparer = new FolderComparer();
         var firstPass = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
@@ -47,13 +49,13 @@ public sealed class FileActionServiceTests : IDisposable
 
         // Origin files must be untouched.
         Assert.True(File.Exists(Path.Combine(_origin, "root1.jpg")));
-        Assert.True(File.Exists(Path.Combine(_origin, "SubA", "a1.jpg")));
-        Assert.True(File.Exists(Path.Combine(_origin, "SubA", "a2.jpg")));
+        Assert.True(File.Exists(Path.Combine(_origin, "root2.jpg")));
+        Assert.True(File.Exists(Path.Combine(_origin, "root3.jpg")));
 
-        // Destination must now mirror the origin's relative structure.
+        // Destination must now have all three, directly at its root.
         Assert.True(File.Exists(Path.Combine(_destination, "root1.jpg")));
-        Assert.True(File.Exists(Path.Combine(_destination, "SubA", "a1.jpg")));
-        Assert.True(File.Exists(Path.Combine(_destination, "SubA", "a2.jpg")));
+        Assert.True(File.Exists(Path.Combine(_destination, "root2.jpg")));
+        Assert.True(File.Exists(Path.Combine(_destination, "root3.jpg")));
 
         var secondPass = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
         Assert.Equal(0, secondPass.MissingFileCount);
@@ -61,15 +63,14 @@ public sealed class FileActionServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task CopyToDestination_CopyingSingleFileFromFolder_LeavesRestStillMissing()
+    public async Task CopyToDestination_CopyingSingleFile_LeavesRestStillMissing()
     {
-        WriteOrigin("SubA/a1.jpg", "b");
-        WriteOrigin("SubA/a2.jpg", "c");
+        WriteOrigin("a1.jpg", "b");
+        WriteOrigin("a2.jpg", "c");
 
         var comparer = new FolderComparer();
         var firstPass = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
-        var subA = Assert.Single(firstPass.Children);
-        var a1 = subA.Children.Single(n => n.Name == "a1.jpg");
+        var a1 = firstPass.Children.Single(n => n.Name == "a1.jpg");
 
         var actionService = new FileActionService();
         await actionService.CopyToDestinationAsync(
@@ -77,7 +78,7 @@ public sealed class FileActionServiceTests : IDisposable
 
         var secondPass = await comparer.CompareAsync(_origin, _destination, progress: null, CancellationToken.None);
         Assert.Equal(1, secondPass.MissingFileCount);
-        var remaining = Assert.Single(secondPass.Children).Children.Single();
+        var remaining = Assert.Single(secondPass.Children);
         Assert.Equal("a2.jpg", remaining.Name);
     }
 }

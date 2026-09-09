@@ -1,25 +1,27 @@
-using System.Collections.Concurrent;
 using iPhotoBackupSync.Core.Models;
 
 namespace iPhotoBackupSync.Core.Services;
 
 /// <summary>
-/// Compares an origin folder tree against a destination folder tree by relative path
-/// (name + structure only -- file contents are never read, which keeps this fast even
-/// for very large photo libraries) and produces a pruned tree of everything that exists
-/// in the origin but not the destination.
+/// Compares the files directly inside an origin folder against the files directly inside
+/// a destination folder (name only -- file contents are never read, which keeps this fast
+/// even for very large photo libraries) and produces the list of files that exist in the
+/// origin but not the destination.
 ///
-/// Designed for tens of thousands of files, possibly over a NAS: directory listings are
-/// performed with bounded parallelism so network latency is hidden behind concurrency
-/// instead of being paid serially per folder.
+/// Deliberately top-level only: subfolders on either side are never descended into. This
+/// app always copies files straight into the destination root, and the origin (an iCloud
+/// Photos folder) is flat too -- any subfolder that shows up at the destination belongs to
+/// something else entirely (in practice, a separate tool that sorts this same folder's
+/// contents into dated Photos/Videos/Documents subfolders after the fact). Comparing
+/// against those would be both pointless (renamed copies never match an origin filename
+/// anyway) and wasteful (that tool's output can run into the tens of thousands of files).
 /// </summary>
 public sealed class FolderComparer
 {
     private readonly CloudSyncStatusProvider _syncStatusProvider = new();
     private readonly BackupManifestService _manifestService = new();
 
-    /// <summary>Max concurrent directory-listing operations. Kept modest by default so a
-    /// NAS isn't hammered; local disks would tolerate a higher number too.</summary>
+    /// <summary>Max concurrent cloud-sync-status lookups for files found to be missing.</summary>
     public int MaxDegreeOfParallelism { get; init; } = Math.Clamp(Environment.ProcessorCount * 4, 4, 16);
 
     public async Task<FileNode> CompareAsync(
@@ -31,50 +33,36 @@ public sealed class FolderComparer
         originRoot = Path.GetFullPath(originRoot);
         destinationRoot = Path.GetFullPath(destinationRoot);
 
-        long dirsScanned = 0;
         long filesScanned = 0;
         long missingFound = 0;
-        var lastReport = DateTime.MinValue;
-        var reportLock = new object();
 
-        void ReportProgress(ComparePhase phase, string? currentPath)
+        void ReportProgress(ComparePhase phase, long dirsScanned, string? currentPath)
         {
-            if (progress is null) return;
-            lock (reportLock)
-            {
-                var now = DateTime.UtcNow;
-                if (now - lastReport < TimeSpan.FromMilliseconds(80) && phase != ComparePhase.Done) return;
-                lastReport = now;
-            }
-            progress.Report(new CompareProgress(phase,
-                Interlocked.Read(ref dirsScanned),
-                Interlocked.Read(ref filesScanned),
-                Interlocked.Read(ref missingFound),
-                currentPath));
+            progress?.Report(new CompareProgress(phase, dirsScanned, filesScanned, missingFound, currentPath));
         }
 
-        // Phase 1: index every relative path that exists under the destination root.
-        var destinationIndex = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        // Phase 1: index the destination root's top-level file names.
+        var destinationIndex = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (Directory.Exists(destinationRoot))
         {
-            using var indexGate = new SemaphoreSlim(MaxDegreeOfParallelism);
-            await IndexDirectoryAsync(destinationRoot, destinationRoot, destinationIndex, indexGate,
-                () => { Interlocked.Increment(ref dirsScanned); ReportProgress(ComparePhase.IndexingDestination, destinationRoot); },
-                cancellationToken);
+            foreach (var name in EnumerateTopLevelFileNames(destinationRoot))
+            {
+                destinationIndex.Add(name);
+            }
         }
+        ReportProgress(ComparePhase.IndexingDestination, 1, destinationRoot);
 
-        // Files (and their ancestor folders) recorded in a backup manifest at the
-        // destination root count as already backed up even if the bytes aren't
-        // actually there -- e.g. archived elsewhere after the fact.
+        // Files recorded in a backup manifest at the destination root count as already
+        // backed up even if the bytes aren't actually there -- e.g. archived elsewhere.
+        // The manifest itself is top-level-only now too, so every entry here is a bare
+        // file name already comparable against an origin file name directly.
         foreach (var manifestPath in _manifestService.ReadManifestPaths(destinationRoot))
         {
-            destinationIndex[manifestPath] = 0;
+            destinationIndex.Add(manifestPath);
         }
 
-        // Phase 2: walk the origin tree, keeping only nodes that are missing from the
-        // destination index or that contain descendants that are.
-        dirsScanned = 0;
-        using var scanGate = new SemaphoreSlim(MaxDegreeOfParallelism);
+        // Phase 2: walk the origin root's top-level files only.
+        cancellationToken.ThrowIfCancellationRequested();
         var rootNode = new FileNode
         {
             Name = Path.GetFileName(originRoot.TrimEnd(Path.DirectorySeparatorChar)) is { Length: > 0 } n ? n : originRoot,
@@ -84,168 +72,72 @@ public sealed class FolderComparer
             IsMissing = !Directory.Exists(destinationRoot)
         };
 
-        await ScanDirectoryAsync(
-            originRoot, originRoot, destinationRoot, destinationIndex, rootNode, scanGate,
-            onFile: () => { Interlocked.Increment(ref filesScanned); ReportProgress(ComparePhase.ScanningOrigin, originRoot); },
-            onDir: () => { Interlocked.Increment(ref dirsScanned); ReportProgress(ComparePhase.ScanningOrigin, originRoot); },
-            onMissing: () => { Interlocked.Increment(ref missingFound); },
-            cancellationToken);
-
-        // Phase 3: compute cloud sync status only for the (much smaller) set of missing files.
-        var missingFiles = new List<FileNode>();
-        CollectMissingFiles(rootNode, missingFiles);
-
-        long statusChecked = 0;
-        await Parallel.ForEachAsync(
-            missingFiles,
-            new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism, CancellationToken = cancellationToken },
-            (node, ct) =>
+        if (Directory.Exists(originRoot))
+        {
+            foreach (var fi in EnumerateTopLevelFiles(originRoot))
             {
-                node.SyncStatus = _syncStatusProvider.GetStatus(node.FullPath);
-                Interlocked.Increment(ref statusChecked);
-                ReportProgress(ComparePhase.CheckingSyncStatus, node.FullPath);
-                return ValueTask.CompletedTask;
-            });
+                cancellationToken.ThrowIfCancellationRequested();
+                filesScanned++;
 
-        RollUpMissingTotals(rootNode);
-        ReportProgress(ComparePhase.Done, null);
-        return rootNode;
-    }
-
-    private static async Task IndexDirectoryAsync(
-        string root,
-        string currentDir,
-        ConcurrentDictionary<string, byte> index,
-        SemaphoreSlim gate,
-        Action onDirectoryScanned,
-        CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        IEnumerable<string> entries;
-        try
-        {
-            entries = Directory.EnumerateFileSystemEntries(currentDir);
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return;
-        }
-        catch (IOException)
-        {
-            return;
-        }
-
-        onDirectoryScanned();
-
-        var subDirTasks = new List<Task>();
-        foreach (var entry in entries)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var relative = Path.GetRelativePath(root, entry);
-            index[relative] = 0;
-
-            if (Directory.Exists(entry))
-            {
-                subDirTasks.Add(RunBoundedAsync(gate, () =>
-                    IndexDirectoryAsync(root, entry, index, gate, onDirectoryScanned, cancellationToken)));
-            }
-        }
-
-        await Task.WhenAll(subDirTasks);
-    }
-
-    private static async Task ScanDirectoryAsync(
-        string root,
-        string currentDir,
-        string destinationRoot,
-        ConcurrentDictionary<string, byte> destinationIndex,
-        FileNode parentNode,
-        SemaphoreSlim gate,
-        Action onFile,
-        Action onDir,
-        Action onMissing,
-        CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        IEnumerable<FileSystemInfo> entries;
-        try
-        {
-            entries = new DirectoryInfo(currentDir).EnumerateFileSystemInfos();
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return;
-        }
-        catch (IOException)
-        {
-            return;
-        }
-
-        var childNodes = new ConcurrentBag<FileNode>();
-        var subDirTasks = new List<Task>();
-
-        foreach (var entry in entries)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var relative = Path.GetRelativePath(root, entry.FullName);
-            var existsInDestination = destinationIndex.ContainsKey(relative);
-            var isDirectory = entry is DirectoryInfo;
-
-            if (isDirectory)
-            {
-                onDir();
-                var dirNode = new FileNode
+                if (!destinationIndex.Contains(fi.Name))
                 {
-                    Name = entry.Name,
-                    FullPath = entry.FullName,
-                    RelativePath = relative,
-                    IsDirectory = true,
-                    IsMissing = !existsInDestination
-                };
-
-                if (!existsInDestination) onMissing();
-
-                subDirTasks.Add(RunBoundedAsync(gate, async () =>
-                {
-                    await ScanDirectoryAsync(root, entry.FullName, destinationRoot, destinationIndex,
-                        dirNode, gate, onFile, onDir, onMissing, cancellationToken);
-
-                    // Only keep this directory in the result tree if it is itself missing
-                    // or it has at least one missing descendant.
-                    if (dirNode.IsMissing || dirNode.Children.Count > 0)
+                    missingFound++;
+                    rootNode.Children.Add(new FileNode
                     {
-                        childNodes.Add(dirNode);
-                    }
-                }));
-            }
-            else
-            {
-                onFile();
-                if (!existsInDestination)
-                {
-                    onMissing();
-                    var fi = (FileInfo)entry;
-                    childNodes.Add(new FileNode
-                    {
-                        Name = entry.Name,
-                        FullPath = entry.FullName,
-                        RelativePath = relative,
+                        Name = fi.Name,
+                        FullPath = fi.FullName,
+                        RelativePath = fi.Name,
                         IsDirectory = false,
                         IsMissing = true,
                         SizeBytes = SafeLength(fi),
                         LastModifiedUtc = SafeLastWriteUtc(fi)
                     });
                 }
+
+                ReportProgress(ComparePhase.ScanningOrigin, 1, originRoot);
             }
         }
 
-        await Task.WhenAll(subDirTasks);
+        rootNode.Children.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
 
-        foreach (var child in childNodes.OrderBy(c => !c.IsDirectory).ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase))
+        // Phase 3: compute cloud sync status only for the (much smaller) set of missing files.
+        long statusChecked = 0;
+        await Parallel.ForEachAsync(
+            rootNode.Children,
+            new ParallelOptions { MaxDegreeOfParallelism = MaxDegreeOfParallelism, CancellationToken = cancellationToken },
+            (node, ct) =>
+            {
+                node.SyncStatus = _syncStatusProvider.GetStatus(node.FullPath);
+                Interlocked.Increment(ref statusChecked);
+                ReportProgress(ComparePhase.CheckingSyncStatus, 1, node.FullPath);
+                return ValueTask.CompletedTask;
+            });
+
+        RollUpMissingTotals(rootNode);
+        ReportProgress(ComparePhase.Done, 1, null);
+        return rootNode;
+    }
+
+    private static IEnumerable<string> EnumerateTopLevelFileNames(string dir) =>
+        EnumerateTopLevelFiles(dir).Select(fi => fi.Name);
+
+    private static List<FileInfo> EnumerateTopLevelFiles(string dir)
+    {
+        // EnumerateFileSystemInfos()/GetFiles() are lazy: the actual directory listing
+        // happens while iterating, not on this call, so materialize inside the try so a
+        // failure partway through a listing (possible on a NAS/network share) is caught
+        // here instead of propagating out.
+        try
         {
-            parentNode.Children.Add(child);
+            return new DirectoryInfo(dir).EnumerateFiles().ToList();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new List<FileInfo>();
+        }
+        catch (IOException)
+        {
+            return new List<FileInfo>();
         }
     }
 
@@ -257,32 +149,6 @@ public sealed class FolderComparer
     private static DateTime? SafeLastWriteUtc(FileInfo fi)
     {
         try { return fi.LastWriteTimeUtc; } catch { return null; }
-    }
-
-    private static async Task RunBoundedAsync(SemaphoreSlim gate, Func<Task> work)
-    {
-        await gate.WaitAsync();
-        try
-        {
-            await work();
-        }
-        finally
-        {
-            gate.Release();
-        }
-    }
-
-    private static void CollectMissingFiles(FileNode node, List<FileNode> result)
-    {
-        if (!node.IsDirectory && node.IsMissing)
-        {
-            result.Add(node);
-        }
-
-        foreach (var child in node.Children)
-        {
-            CollectMissingFiles(child, result);
-        }
     }
 
     private static void RollUpMissingTotals(FileNode node)

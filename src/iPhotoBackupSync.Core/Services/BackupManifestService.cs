@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 
@@ -24,9 +23,6 @@ public readonly record struct ManifestGenerationResult(int TotalEntries, int New
 public sealed class BackupManifestService
 {
     public const string ManifestFileName = "iPhotoBackupSync.manifest.txt";
-
-    /// <summary>Max concurrent directory-listing operations when generating a manifest.</summary>
-    public int MaxDegreeOfParallelism { get; init; } = Math.Clamp(Environment.ProcessorCount * 4, 4, 16);
 
     /// <summary>
     /// Reads the manifest file at <paramref name="destinationRoot"/>, if one exists, and
@@ -65,12 +61,21 @@ public sealed class BackupManifestService
     }
 
     /// <summary>
-    /// Scans every file currently in <paramref name="folderRoot"/> (recursively) and adds
-    /// each one to the manifest file at its root, creating the file if it doesn't exist
-    /// yet. This only ever adds or refreshes entries for files that are still physically
-    /// present -- it never removes an existing entry, even one for a file no longer found
-    /// in this scan (e.g. because it was archived elsewhere after being recorded), since
-    /// that entry may be the only remaining record that the file was ever backed up.
+    /// Scans every file directly inside <paramref name="folderRoot"/> -- top-level only,
+    /// subfolders are never descended into -- and adds each one to the manifest file at its
+    /// root, creating the file if it doesn't exist yet. This only ever adds or refreshes
+    /// entries for files that are still physically present -- it never removes an existing
+    /// entry, even one for a file no longer found in this scan (e.g. because it was archived
+    /// elsewhere after being recorded), since that entry may be the only remaining record
+    /// that the file was ever backed up.
+    ///
+    /// Deliberately not recursive: this app always copies files straight into the
+    /// destination root (it never mirrors origin subfolders), so any subfolder here belongs
+    /// to something else entirely -- in practice, a separate file-organizer tool that sorts
+    /// this same folder's contents into dated Photos/Videos/Documents subfolders. Recursing
+    /// into those used to record every one of its reorganized copies as if it were a
+    /// separate backed-up file, tripling up entries for the same photo and making the
+    /// manifest grow without bound every time that tool ran.
     /// </summary>
     public async Task<ManifestGenerationResult> GenerateManifestAsync(
         string folderRoot,
@@ -98,13 +103,7 @@ public sealed class BackupManifestService
         }
         var previousCount = merged.Count;
 
-        var scannedEntries = new ConcurrentBag<ManifestEntry>();
-        long scanned = 0;
-        using var gate = new SemaphoreSlim(MaxDegreeOfParallelism);
-
-        await CollectEntriesAsync(folderRoot, folderRoot, manifestPath, scannedEntries, gate,
-            () => progress?.Report((int)Interlocked.Increment(ref scanned)),
-            cancellationToken);
+        var scannedEntries = CollectTopLevelEntries(folderRoot, manifestPath, progress, cancellationToken);
 
         // Add newly found files and refresh size/date for ones already recorded that are
         // still present; entries for files not seen in this scan are left untouched.
@@ -211,70 +210,47 @@ public sealed class BackupManifestService
 
     private readonly record struct ManifestEntry(string RelativePath, long SizeBytes, DateTime? LastModifiedUtc);
 
-    private static async Task CollectEntriesAsync(
+    private static List<ManifestEntry> CollectTopLevelEntries(
         string root,
-        string currentDir,
         string manifestPath,
-        ConcurrentBag<ManifestEntry> entries,
-        SemaphoreSlim gate,
-        Action onFile,
+        IProgress<int>? progress,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
+        var entries = new List<ManifestEntry>();
+        var scanned = 0;
+
         // EnumerateFileSystemInfos() is lazy: the actual directory listing happens while
-        // iterating, not on this call, so a plain try/catch around the call above would
-        // never see an error that occurs partway through a listing (common on a NAS/network
+        // iterating, not on this call, so a plain try/catch around the call above wouldn't
+        // catch an error that occurs partway through a listing (possible on a NAS/network
         // share that hiccups mid-enumeration). Materialize the whole listing inside the try
-        // instead, so any such failure is caught here and only skips this one folder,
-        // instead of propagating up and aborting the entire scan.
+        // instead, so any such failure is caught here rather than propagating out.
         List<FileSystemInfo> items;
         try
         {
-            items = new DirectoryInfo(currentDir).EnumerateFileSystemInfos().ToList();
+            items = new DirectoryInfo(root).EnumerateFileSystemInfos().ToList();
         }
         catch (UnauthorizedAccessException)
         {
-            return;
+            return entries;
         }
         catch (IOException)
         {
-            return;
+            return entries;
         }
 
-        var subDirTasks = new List<Task>();
         foreach (var item in items)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (item is DirectoryInfo)
-            {
-                subDirTasks.Add(RunBoundedAsync(gate, () =>
-                    CollectEntriesAsync(root, item.FullName, manifestPath, entries, gate, onFile, cancellationToken)));
-            }
-            else if (item is FileInfo fi)
-            {
-                if (string.Equals(fi.FullName, manifestPath, StringComparison.OrdinalIgnoreCase)) continue;
+            if (item is not FileInfo fi) continue; // subfolders are never descended into
+            if (string.Equals(fi.FullName, manifestPath, StringComparison.OrdinalIgnoreCase)) continue;
 
-                var relative = Path.GetRelativePath(root, fi.FullName);
-                entries.Add(new ManifestEntry(relative, SafeLength(fi), SafeLastWriteUtc(fi)));
-                onFile();
-            }
+            entries.Add(new ManifestEntry(fi.Name, SafeLength(fi), SafeLastWriteUtc(fi)));
+            progress?.Report(++scanned);
         }
 
-        await Task.WhenAll(subDirTasks);
-    }
-
-    private static async Task RunBoundedAsync(SemaphoreSlim gate, Func<Task> work)
-    {
-        await gate.WaitAsync();
-        try
-        {
-            await work();
-        }
-        finally
-        {
-            gate.Release();
-        }
+        return entries;
     }
 
     private static long SafeLength(FileInfo fi)

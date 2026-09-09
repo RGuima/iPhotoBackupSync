@@ -19,7 +19,7 @@ public sealed class BackupManifestServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task GenerateManifest_RecordsEveryExistingFile()
+    public async Task GenerateManifest_RecordsTopLevelFilesOnly()
     {
         File.WriteAllText(Path.Combine(_root, "a.jpg"), "x");
         Directory.CreateDirectory(Path.Combine(_root, "Sub"));
@@ -28,16 +28,18 @@ public sealed class BackupManifestServiceTests : IDisposable
         var service = new BackupManifestService();
         var result = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
 
-        Assert.Equal(2, result.TotalEntries);
-        Assert.Equal(2, result.NewEntries);
+        // Subfolders are never descended into -- a separate tool that sorts this same
+        // destination folder's contents into dated subfolders shouldn't have every one of
+        // its reorganized copies recorded as if it were a distinct backed-up file.
+        Assert.Equal(1, result.TotalEntries);
+        Assert.Equal(1, result.NewEntries);
         Assert.Equal(0, result.PreviousEntries);
         var manifestPath = Path.Combine(_root, BackupManifestService.ManifestFileName);
         Assert.True(File.Exists(manifestPath));
 
         var recorded = service.ReadManifestPaths(_root);
         Assert.Contains("a.jpg", recorded);
-        Assert.Contains(Path.Combine("Sub", "b.jpg"), recorded);
-        Assert.Contains("Sub", recorded); // ancestor folder implied present too
+        Assert.DoesNotContain(Path.Combine("Sub", "b.jpg"), recorded);
     }
 
     [Fact]
