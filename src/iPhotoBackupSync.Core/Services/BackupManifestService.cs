@@ -80,6 +80,17 @@ public sealed class BackupManifestService
         folderRoot = Path.GetFullPath(folderRoot);
         var manifestPath = Path.Combine(folderRoot, ManifestFileName);
 
+        // Fail fast instead of silently treating an unreachable destination (e.g. a NAS
+        // share that's off, asleep, or unmapped when an unattended run starts) as an empty
+        // folder -- that would read 0 previous entries AND scan 0 files, so the safety net
+        // below (which compares counts) wouldn't see anything wrong, and would write a
+        // near-empty manifest over one that may have tens of thousands of real entries.
+        if (!Directory.Exists(folderRoot))
+        {
+            throw new DirectoryNotFoundException(
+                $"Destination folder is not reachable, refusing to touch its manifest: {folderRoot}");
+        }
+
         var merged = new Dictionary<string, ManifestEntry>(StringComparer.OrdinalIgnoreCase);
         foreach (var existing in ReadRawEntries(manifestPath))
         {
@@ -120,6 +131,24 @@ public sealed class BackupManifestService
               .Append(entry.SizeBytes.ToString(CultureInfo.InvariantCulture)).Append('\t')
               .Append(entry.LastModifiedUtc?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty)
               .Append('\n');
+        }
+
+        // Safety net: if a manifest is already on disk right now and it has more entries
+        // than what we're about to write, refuse to overwrite it. Merging never removes an
+        // entry by design, so the only way the new content could be smaller is if reading
+        // and/or scanning the destination failed partway through this run -- e.g. a NAS
+        // share was still waking up its disks when an unattended 3am scheduled run started,
+        // making File.Exists/File.ReadLines see nothing at the moment they were checked.
+        // Silently overwriting in that case would look identical to "this folder legitimately
+        // lost half its files" from the outside; refuse instead, and leave the old file alone.
+        var onDiskCount = ReadRawEntries(manifestPath).Count;
+        if (onDiskCount > sorted.Count)
+        {
+            throw new IOException(
+                $"Refusing to overwrite manifest at \"{manifestPath}\": it currently has {onDiskCount:N0} " +
+                $"entries on disk, but this run only produced {sorted.Count:N0} after merging. The destination " +
+                "was likely temporarily unreachable during part of this run (e.g. a NAS share still waking " +
+                "up). Nothing was written -- try again once the destination is reliably reachable.");
         }
 
         await File.WriteAllTextAsync(manifestPath, sb.ToString(), Encoding.UTF8, cancellationToken);
@@ -167,10 +196,16 @@ public sealed class BackupManifestService
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        IEnumerable<FileSystemInfo> items;
+        // EnumerateFileSystemInfos() is lazy: the actual directory listing happens while
+        // iterating, not on this call, so a plain try/catch around the call above would
+        // never see an error that occurs partway through a listing (common on a NAS/network
+        // share that hiccups mid-enumeration). Materialize the whole listing inside the try
+        // instead, so any such failure is caught here and only skips this one folder,
+        // instead of propagating up and aborting the entire scan.
+        List<FileSystemInfo> items;
         try
         {
-            items = new DirectoryInfo(currentDir).EnumerateFileSystemInfos();
+            items = new DirectoryInfo(currentDir).EnumerateFileSystemInfos().ToList();
         }
         catch (UnauthorizedAccessException)
         {
