@@ -46,8 +46,8 @@ public sealed class BackupManifestServiceTests : IDisposable
         Assert.True(File.Exists(manifestPath));
 
         var recorded = service.ReadManifestFingerprints(_root);
-        Assert.Contains(new FileFingerprint(1, modified), recorded); // "x"
-        Assert.DoesNotContain(new FileFingerprint(2, modified), recorded); // "yy", in Sub
+        Assert.Contains(FileFingerprint.FromFileName("a.jpg", 1), recorded); // "x"
+        Assert.DoesNotContain(FileFingerprint.FromFileName("b.jpg", 2), recorded); // "yy", in Sub
     }
 
     [Fact]
@@ -83,8 +83,8 @@ public sealed class BackupManifestServiceTests : IDisposable
         Assert.Equal(2, second.TotalEntries);
 
         var recorded = service.ReadManifestFingerprints(_root);
-        Assert.Contains(new FileFingerprint(1, modifiedA), recorded); // never removed, even gone from disk
-        Assert.Contains(new FileFingerprint(2, modifiedB), recorded);
+        Assert.Contains(FileFingerprint.FromFileName("a.jpg", 1), recorded); // never removed, even gone from disk
+        Assert.Contains(FileFingerprint.FromFileName("b.jpg", 2), recorded);
     }
 
     [Fact]
@@ -122,6 +122,30 @@ public sealed class BackupManifestServiceTests : IDisposable
         Assert.True(zIndex >= 0 && addedMarkerIndex >= 0 && aIndex >= 0);
         Assert.True(zIndex < addedMarkerIndex, "existing entry should stay before the new batch's marker");
         Assert.True(addedMarkerIndex < aIndex, "new entry should come after its batch's marker");
+    }
+
+    [Fact]
+    public async Task GenerateManifest_TimestampDriftWithSameSizeAndName_IsNotTreatedAsNew()
+    {
+        // The actual root cause found in production: iCloud rewrites a file's local
+        // last-modified time when it re-hydrates/re-touches it, by months or years,
+        // completely independent of the photo's real content -- size stayed byte-identical
+        // across a sample of 25 real files while only 2 still had their original date. Date
+        // must not be part of the fingerprint, or nearly an entire already-backed-up library
+        // looks "new" again after iCloud quietly rewrites its timestamps.
+        var service = new BackupManifestService();
+        var path = Path.Combine(_root, "a.jpg");
+        WriteFile(path, "unchanged-content", new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        var first = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
+        Assert.Equal(1, first.NewEntries);
+
+        // Same bytes, same name -- only the timestamp drifted, as iCloud does in practice.
+        File.SetLastWriteTimeUtc(path, new DateTime(2026, 6, 6, 0, 0, 0, DateTimeKind.Utc));
+        var second = await service.GenerateManifestAsync(_root, progress: null, CancellationToken.None);
+
+        Assert.Equal(1, second.PreviousEntries);
+        Assert.Equal(0, second.NewEntries);
+        Assert.Equal(1, second.TotalEntries);
     }
 
     [Fact]

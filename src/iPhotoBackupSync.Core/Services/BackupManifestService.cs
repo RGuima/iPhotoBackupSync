@@ -10,9 +10,10 @@ namespace iPhotoBackupSync.Core.Services;
 /// even though the actual bytes aren't (or are no longer) present in that folder --
 /// e.g. because they were archived to offline media, a different drive, or cold
 /// storage after the fact. A manifest entry is matched by <see cref="FileFingerprint"/>
-/// (size + last-modified time), the same signal <see cref="FolderComparer"/> uses to
-/// decide whether a file exists in the destination -- not by name, since iCloud can
-/// reassign a name to different content over time (see <see cref="FileFingerprint"/>).
+/// (size + name with any iCloud duplicate suffix stripped), the same signal
+/// <see cref="FolderComparer"/> uses to decide whether a file exists in the destination --
+/// not by the literal name, and not by last-modified time (see <see cref="FileFingerprint"/>
+/// for why both of those turned out to be unreliable).
 /// </summary>
 /// <summary>
 /// Result of a manifest generation pass: <paramref name="TotalEntries"/> is the full
@@ -28,8 +29,8 @@ public sealed class BackupManifestService
 
     /// <summary>
     /// Reads the manifest file at <paramref name="destinationRoot"/>, if one exists, and
-    /// returns the content fingerprint (size + last-modified time) of every file it
-    /// records. Returns an empty set if there is no manifest.
+    /// returns the content fingerprint of every file it records. Returns an empty set if
+    /// there is no manifest.
     /// </summary>
     public IReadOnlySet<FileFingerprint> ReadManifestFingerprints(string destinationRoot)
     {
@@ -51,10 +52,10 @@ public sealed class BackupManifestService
     /// elsewhere after being recorded), since that entry may be the only remaining record
     /// that the file was ever backed up.
     ///
-    /// Existing entries are matched by <see cref="FileFingerprint"/> (size + last-modified
-    /// time), not by name, and keep their original position in the file even when refreshed
-    /// -- only the recorded name is updated, in case iCloud renamed the file since the last
-    /// scan. Entries are never resorted; files new to this run are appended at the very end
+    /// Existing entries are matched by <see cref="FileFingerprint"/>, not by the literal
+    /// name, and keep their original position in the file even when refreshed -- only the
+    /// recorded name is updated, in case iCloud renamed the file since the last scan.
+    /// Entries are never resorted; files new to this run are appended at the very end
     /// instead, preceded by a "# Added &lt;timestamp&gt;" comment marking that batch -- so
     /// the file reads as a rough history of when things were added, and a diff between two
     /// versions only ever shows a new block tacked on the end.
@@ -88,13 +89,13 @@ public sealed class BackupManifestService
 
         var body = ParseBody(manifestPath);
 
-        // Map each existing entry's content fingerprint (size + last-modified time, not
-        // name -- see FileFingerprint) to its position in `body`, so a file that's still
-        // present gets its recorded name refreshed in place if iCloud has since renamed it;
-        // new entries are the only ones that ever get appended. Two entries can't collide on
-        // fingerprint here since ParseBody never returns duplicate fingerprints for distinct
-        // files unless the destination genuinely has byte-identical duplicates, in which
-        // case treating them as one backed-up item is correct.
+        // Map each existing entry's content fingerprint (see FileFingerprint -- size plus
+        // name with any iCloud duplicate suffix stripped) to its position in `body`, so a
+        // file that's still present gets its recorded name refreshed in place if iCloud has
+        // since renamed it; new entries are the only ones that ever get appended. Two
+        // entries can't collide on fingerprint here unless the destination genuinely has
+        // byte-identical duplicates, in which case treating them as one backed-up item is
+        // correct.
         var existingIndex = new Dictionary<FileFingerprint, int>();
         for (var i = 0; i < body.Count; i++)
         {
@@ -256,7 +257,7 @@ public sealed class BackupManifestService
 
     private readonly record struct ManifestEntry(string RelativePath, long SizeBytes, DateTime? LastModifiedUtc)
     {
-        public FileFingerprint Fingerprint => new(SizeBytes, LastModifiedUtc);
+        public FileFingerprint Fingerprint => FileFingerprint.FromFileName(RelativePath, SizeBytes);
     }
 
     /// <summary>One line of the manifest body: either a preserved comment or a data entry,

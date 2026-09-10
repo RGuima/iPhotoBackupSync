@@ -5,23 +5,29 @@ iCloud Photos folder) against a **destination** backup folder (local disk or
 NAS), and shows every file directly in the origin that's missing from the
 destination.
 
-Built for large photo libraries: comparison is by size + last-modified time
-(a file's *content fingerprint* -- bytes are never read or hashed, and names
-are never trusted), and the UI list is virtualized -- so it stays responsive
-across tens of thousands of files.
+Built for large photo libraries: comparison is by size plus name with any
+iCloud duplicate suffix stripped (a file's *content fingerprint* -- bytes are
+never read or hashed, and the literal name and last-modified time are never
+trusted), and the UI list is virtualized -- so it stays responsive across
+tens of thousands of files.
 
 ## Features
 
 - **Folder comparison** -- top-level only: finds files present directly in
   the origin folder but absent directly in the destination folder, and shows
-  totals (missing file count, missing size). Matching is by **size and
-  last-modified time, not name** -- iCloud renames files as part of its own
-  sync/conflict resolution over time (observed in practice: a plain name
-  like `IMG_1596.HEIC` got reassigned to a different, newer photo while the
-  original became `IMG_1596(1).HEIC`), so matching by name alone can both
-  hide a genuinely-missing file behind a stale same-named entry and falsely
-  re-flag an already-backed-up file that iCloud happened to rename. Subfolders
-  on either side are never descended into or compared -- both the real origin
+  totals (missing file count, missing size). Matching is by **size plus name
+  with any `(N)` duplicate suffix stripped** -- not the literal name, and not
+  last-modified time. iCloud renames files as part of its own sync/conflict
+  resolution over time (observed in practice: a plain name like
+  `IMG_1596.HEIC` got reassigned to a different, newer photo while the
+  original became `IMG_1596(1).HEIC`), so matching by the literal name alone
+  can both hide a genuinely-missing file behind a stale same-named entry and
+  falsely re-flag an already-backed-up file that iCloud happened to rename.
+  Last-modified time was tried too and abandoned: sampling a real 52,000+
+  file library found iCloud rewrites a file's local timestamp by months or
+  years, completely independent of its actual content, so date is not a
+  usable signal for this at all (see Notes & limitations). Subfolders on
+  either side are never descended into or compared -- both the real origin
   (an iCloud Photos folder) and this app's own copies are always flat, so a
   subfolder showing up at the destination belongs to something else entirely
   (in practice, a separate tool that reorganizes that same folder's contents
@@ -62,8 +68,8 @@ across tens of thousands of files.
   already backed up even though the bytes themselves aren't (or are no
   longer) sitting in that folder -- for example, photos you copied out to an
   archive drive or optical media afterwards. Compare reads this file
-  automatically and treats every fingerprint (size + last-modified time) it
-  lists as present, regardless of what name is recorded alongside it.
+  automatically and treats every fingerprint (size + de-suffixed name) it
+  lists as present, regardless of what literal name is recorded alongside it.
   **Generate Manifest for Folder...** creates this file for any folder you
   pick (or updates it if one is already there), recording every file that
   currently exists directly in it (top-level only, same as Compare) --
@@ -125,13 +131,13 @@ dotnet test src/iPhotoBackupSync.Tests/iPhotoBackupSync.Tests.csproj
 ## How the comparison works
 
 1. The destination folder's top-level files are indexed into an in-memory
-   set of content fingerprints (size + last-modified time), plus every
-   fingerprint recorded in the backup manifest, if any (subfolders are not
-   descended into or indexed).
+   set of content fingerprints (size + name with any `(N)` duplicate suffix
+   stripped), plus every fingerprint recorded in the backup manifest, if any
+   (subfolders are not descended into or indexed).
 2. The origin folder's top-level files are then listed the same way. Any
    file whose fingerprint isn't in the destination index is missing; origin
-   subfolders are never visited. Names are never compared -- only content
-   fingerprints.
+   subfolders are never visited. Literal names and last-modified times are
+   never compared -- only fingerprints.
 3. Cloud sync status is looked up only for files that are actually missing
    (not the whole origin folder), which keeps the relatively expensive
    native call count proportional to the size of the backup gap, not the
@@ -155,32 +161,46 @@ dotnet test src/iPhotoBackupSync.Tests/iPhotoBackupSync.Tests.csproj
   OneDrive manages is judged purely on iCloud's own marker, never on what
   OneDrive thinks of it. Neither mechanism reports a live "% complete" for
   an in-flight transfer.
-- Comparison is by **size + last-modified time (a content fingerprint),
-  top-level files only** -- names are never compared, file bytes are never
-  read/hashed, and it never looks inside subfolders on either side. Matching
-  by fingerprint instead of name was a deliberate fix after finding that
-  iCloud can reassign a plain name to entirely different content over time
-  (a real `IMG_1596.HEIC` got reassigned to a new, different photo while the
-  original file was renamed to `IMG_1596(1).HEIC`) -- matching by name alone
-  meant the app could treat a brand-new, never-backed-up file as "already
-  present" just because something else once occupied that exact name. The
-  trade-off: a file placed in a subfolder on either side is invisible to
-  Compare entirely (see the top-level-only note above), and in the
-  astronomically unlikely case that two genuinely different files share the
-  exact same size and last-modified timestamp to the tick, one could be
-  mistaken for the other.
+- Comparison is by **size + name with any `(N)` duplicate suffix stripped
+  (a content fingerprint), top-level files only** -- the literal name and
+  last-modified time are never compared, file bytes are never read/hashed,
+  and it never looks inside subfolders on either side. Two things were tried
+  and rejected before landing here:
+  - **Matching by the literal name** meant the app could treat a brand-new,
+    never-backed-up file as "already present" just because something else
+    once occupied that exact name -- a real `IMG_1596.HEIC` got reassigned
+    by iCloud to a new, different photo while the original file was renamed
+    to `IMG_1596(1).HEIC`, and the stale entry under the old name masked the
+    new file entirely.
+  - **Adding last-modified time to the fingerprint** (size + date) was meant
+    to fix that without depending on names at all, but sampling 25 random
+    entries from a real 52,000+ file library after some time had passed
+    found iCloud had rewritten **23 of the 25** files' local timestamps --
+    by months or years in several cases -- while every file's size stayed
+    byte-identical. Using date this way caused almost the entire
+    already-backed-up library to look "missing" again and triggered a mass
+    unnecessary re-sync attempt.
+
+  The trade-off with size + de-suffixed name: a file placed in a subfolder
+  on either side is invisible to Compare entirely (see the top-level-only
+  note above), and two genuinely different files that happen to share both
+  an exact byte size and the same name (ignoring an `(N)` suffix) would be
+  mistaken for each other -- judged an acceptable risk given real photos
+  essentially never collide on exact byte size, and it's far less likely
+  than the failure modes of literal-name or date-based matching above.
 - The "Copy Selected to Destination" action copies files straight into the
   destination root; it never deletes or overwrites files in the origin, it
-  never overwrites a same-named destination file that turns out to have a
-  different fingerprint (it picks an alternate name instead), and it will
-  prompt before creating a destination folder that doesn't exist yet.
-- **The manifest is matched by fingerprint (size + last-modified time), not
-  name** -- the same signal Compare uses to detect a file's presence in the
-  destination -- and (like Compare) it only ever records files directly in
-  the destination root, not in subfolders. The recorded name is refreshed in
-  place if iCloud renames the file later, but the fingerprint is the actual
-  join key. Deleting a line, or the whole `iPhotoBackupSync.manifest.txt`
-  file, makes that file show up as missing again on the next Compare.
+  never overwrites a same-named destination file that turns out to be a
+  different size, and it will prompt before creating a destination folder
+  that doesn't exist yet.
+- **The manifest is matched by fingerprint (size + de-suffixed name), not
+  the literal name or last-modified time** -- the same signal Compare uses
+  to detect a file's presence in the destination -- and (like Compare) it
+  only ever records files directly in the destination root, not in
+  subfolders. The recorded literal name is refreshed in place if iCloud
+  renames the file later, but the fingerprint is the actual join key.
+  Deleting a line, or the whole `iPhotoBackupSync.manifest.txt` file, makes
+  that file show up as missing again on the next Compare.
 - **Force Sync restarts the detected iCloud process(es)** (iCloud Photos /
   iCloud Drive / iCloud Services) and pins the target files (`attrib +P -U`),
   the same mechanism as the standalone "Cloud Sync Forcer" tool -- this is a

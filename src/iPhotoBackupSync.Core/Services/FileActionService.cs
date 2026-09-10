@@ -49,8 +49,7 @@ public sealed class FileActionService
             }
 
             var sourceInfo = new FileInfo(file.FullPath);
-            var sourceFingerprint = new FileFingerprint(SafeLength(sourceInfo), SafeLastWriteUtc(sourceInfo));
-            destPath = ResolveSafeDestinationPath(destPath, sourceFingerprint);
+            destPath = ResolveSafeDestinationPath(destPath, SafeLength(sourceInfo));
 
             await using (var source = File.OpenRead(file.FullPath))
             await using (var dest = File.Create(destPath))
@@ -65,16 +64,14 @@ public sealed class FileActionService
     }
 
     /// <summary>Returns <paramref name="destPath"/> unchanged if nothing is there yet, or if
-    /// what's there already has the same content fingerprint (genuinely the same file, safe
-    /// to overwrite in place). Otherwise a different file already occupies that name, so
-    /// this returns the first "name (1)", "name (2)", ... variant that's free.</summary>
-    private static string ResolveSafeDestinationPath(string destPath, FileFingerprint sourceFingerprint)
+    /// what's there already has the same size (genuinely the same file, safe to overwrite in
+    /// place -- the name is identical by construction here, so size is the only remaining
+    /// signal). Otherwise a different file already occupies that name, so this returns the
+    /// first "name (1)", "name (2)", ... variant that's free.</summary>
+    private static string ResolveSafeDestinationPath(string destPath, long sourceSize)
     {
         if (!File.Exists(destPath)) return destPath;
-
-        var existing = new FileInfo(destPath);
-        var existingFingerprint = new FileFingerprint(SafeLength(existing), SafeLastWriteUtc(existing));
-        if (existingFingerprint == sourceFingerprint) return destPath;
+        if (SafeLength(new FileInfo(destPath)) == sourceSize) return destPath;
 
         var dir = Path.GetDirectoryName(destPath) ?? string.Empty;
         var baseName = Path.GetFileNameWithoutExtension(destPath);
@@ -92,11 +89,6 @@ public sealed class FileActionService
     private static long SafeLength(FileInfo fi)
     {
         try { return fi.Length; } catch { return 0; }
-    }
-
-    private static DateTime? SafeLastWriteUtc(FileInfo fi)
-    {
-        try { return fi.LastWriteTimeUtc; } catch { return null; }
     }
 
     public void ExportToCsv(IEnumerable<FileNode> nodes, string csvPath)

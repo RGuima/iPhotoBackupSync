@@ -5,13 +5,12 @@ namespace iPhotoBackupSync.Core.Services;
 /// <summary>
 /// Compares the files directly inside an origin folder against the files directly inside
 /// a destination folder and produces the list of files that exist in the origin but not
-/// the destination. Matching is by <see cref="FileFingerprint"/> (size + last-modified
-/// time), not by name: iCloud renames files as part of its own sync/conflict resolution
-/// over time (observed in practice: a plain name like "IMG_1596.HEIC" got reassigned to a
-/// different, newer photo while the original became "IMG_1596(1).HEIC"), so matching by
-/// name alone can both hide a genuinely-missing file behind a stale same-named entry and
-/// falsely re-flag an already-backed-up file that iCloud happened to rename. File contents
-/// themselves are still never read/hashed, which keeps this fast on very large libraries.
+/// the destination. Matching is by <see cref="FileFingerprint"/> -- size plus name with any
+/// iCloud duplicate suffix stripped -- rather than the literal name (survives iCloud
+/// renaming a file, e.g. "IMG_1596.HEIC" becoming "IMG_1596(1).HEIC") or last-modified time
+/// (found to drift by months or years independent of a file's actual content on a real
+/// iCloud Photos library; see <see cref="FileFingerprint"/>). File contents themselves are
+/// still never read/hashed, which keeps this fast on very large libraries.
 ///
 /// Deliberately top-level only: subfolders on either side are never descended into. This
 /// app always copies files straight into the destination root, and the origin (an iCloud
@@ -52,7 +51,7 @@ public sealed class FolderComparer
         {
             foreach (var fi in EnumerateTopLevelFiles(destinationRoot))
             {
-                destinationIndex.Add(new FileFingerprint(SafeLength(fi), SafeLastWriteUtc(fi)));
+                destinationIndex.Add(FileFingerprint.FromFileName(fi.Name, SafeLength(fi)));
             }
         }
         ReportProgress(ComparePhase.IndexingDestination, 1, destinationRoot);
@@ -83,8 +82,7 @@ public sealed class FolderComparer
                 filesScanned++;
 
                 var size = SafeLength(fi);
-                var modified = SafeLastWriteUtc(fi);
-                if (!destinationIndex.Contains(new FileFingerprint(size, modified)))
+                if (!destinationIndex.Contains(FileFingerprint.FromFileName(fi.Name, size)))
                 {
                     missingFound++;
                     rootNode.Children.Add(new FileNode
@@ -95,7 +93,7 @@ public sealed class FolderComparer
                         IsDirectory = false,
                         IsMissing = true,
                         SizeBytes = size,
-                        LastModifiedUtc = modified
+                        LastModifiedUtc = SafeLastWriteUtc(fi)
                     });
                 }
 
